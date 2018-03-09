@@ -16,6 +16,7 @@ at anytime.
   * fixed the inconsistencies in API and CLI docstrings
   * `blob_announce` error when announcing a single blob
   * `blob_list` error when looking up blobs by stream or sd hash
+  *
 
 ### Deprecated
   * `report_bug` jsonrpc command
@@ -24,6 +25,7 @@ at anytime.
 ### Changed
   * reflector server to periodically check and set `should_announce` for sd and head blobs instead of during each request
   * reflector server to use `SQLiteStorage` to find needed blob hashes for a stream
+  *
 
 ### Added
   * scripts to autogenerate documentation
@@ -31,6 +33,7 @@ at anytime.
 
 ### Removed
   * short(single dashed) arguments for `lbrynet-cli`
+  * `flags` decorator from server.py as short flags are no longer used when using api/cli methods
   *
 
 
