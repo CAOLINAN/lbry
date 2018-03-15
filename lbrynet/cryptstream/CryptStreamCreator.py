@@ -86,9 +86,10 @@ class CryptStreamCreator(object):
         self.stopped = True
         if self.current_blob is not None:
             self._close_current_blob()
-        d = self._finalize()
-        d.addCallback(lambda _: self._finished())
-        return d
+        self._finalize()
+        dl = defer.DeferredList(self.finished_deferreds)
+        dl.addCallback(lambda _: self._finished())
+        return dl
 
     # TODO: move the stream creation process to its own thread and
     #       remove the reactor from this process.
@@ -111,7 +112,6 @@ class CryptStreamCreator(object):
 
         return defer.succeed(True)
 
-    @defer.inlineCallbacks
     def _finalize(self):
         """
         Finalize a stream by adding an empty
@@ -119,14 +119,15 @@ class CryptStreamCreator(object):
         the stream has ended. This empty blob is not
         saved to the blob manager
         """
-
-        yield defer.DeferredList(self.finished_deferreds)
+        log.debug("_finalize has been called")
         self.blob_count += 1
         iv = self.iv_generator.next()
-        final_blob = self._get_blob_maker(iv, self.blob_manager.get_blob_creator())
-        stream_terminator = yield final_blob.close()
-        terminator_info = yield self._blob_finished(stream_terminator)
-        defer.returnValue(terminator_info)
+        final_blob_creator = self.blob_manager.get_blob_creator()
+        final_blob = self._get_blob_maker(iv, final_blob_creator)
+        d = final_blob.close()
+        d.addCallback(self._blob_finished)
+        self.finished_deferreds.append(d)
+
 
     def _write(self, data):
         while len(data) > 0:

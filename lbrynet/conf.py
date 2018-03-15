@@ -1,3 +1,4 @@
+#coding=utf-8
 import base58
 import json
 import logging
@@ -8,7 +9,7 @@ import yaml
 import envparse
 from appdirs import user_data_dir, user_config_dir
 from lbrynet.core import utils
-from lbrynet.core.Error import InvalidCurrencyError, NoSuchDirectoryError
+from lbrynet.core.Error import InvalidCurrencyError
 from lbrynet.androidhelpers.paths import (
     android_internal_storage_dir,
     android_app_internal_storage_dir
@@ -41,9 +42,10 @@ KB = 2 ** 10
 MB = 2 ** 20
 
 DEFAULT_DHT_NODES = [
-    ('lbrynet1.lbry.io', 4444),
-    ('lbrynet2.lbry.io', 4444),
-    ('lbrynet3.lbry.io', 4444)
+    ('47.75.4.172', 4444),
+    # ('lbrynet2.lbry.io', 4444),
+    # ('lbrynet2.lbry.io', 4444),
+    # ('lbrynet3.lbry.io', 4444)
 ]
 
 settings_decoders = {
@@ -55,9 +57,6 @@ settings_encoders = {
     '.json': json.dumps,
     '.yml': yaml.safe_dump
 }
-
-# set by CLI when the user specifies an alternate config file path
-conf_file = None
 
 
 def _win_path_to_bytes(path):
@@ -163,12 +162,10 @@ def server_port(server_and_port):
     return server, int(port)
 
 
-def server_list(servers):
-    return [server_port(server) for server in servers]
-
-
 class Env(envparse.Env):
-    """An Env parser that automatically namespaces the variables with LBRY"""
+    """An Env parser that automatically namespaces the variables with LBRY
+    一个Env(环境变量)解析器, 该解析器自动使用LBRY做前缀命名变量
+    """
 
     def __init__(self, **schema):
         self.original_schema = schema
@@ -192,8 +189,8 @@ class Env(envparse.Env):
 
         If you do this, the tuple/list must be of the
         form (cast, default) or (cast, default, subcast)
+        把元组变成转换成下面3个key的字典
         """
-
         if isinstance(value, (tuple, list)):
             new_value = {'cast': value[0], 'default': value[1]}
             if len(value) == 3:
@@ -208,6 +205,7 @@ TYPE_ENV = 'env'
 TYPE_CLI = 'cli'
 TYPE_RUNTIME = 'runtime'
 
+# 固定设置
 FIXED_SETTINGS = {
     'ANALYTICS_ENDPOINT': 'https://api.segment.io/v1',
     'ANALYTICS_TOKEN': 'Ax5LZzR1o3q3Z3WjATASDwR5rKyHH0qOIRIbLmMXn2H=',
@@ -236,6 +234,7 @@ FIXED_SETTINGS = {
     'WALLET_TYPES': [LBRYUM_WALLET, LBRYCRD_WALLET],
 }
 
+# 可调整设置
 ADJUSTABLE_SETTINGS = {
     # By default, daemon will block all cross origin requests
     # but if this is set, this value will be used for the
@@ -263,7 +262,7 @@ ADJUSTABLE_SETTINGS = {
     'download_timeout': (int, 180),
     'is_generous_host': (bool, True),
     'announce_head_blobs_only': (bool, True),
-    'known_dht_nodes': (list, DEFAULT_DHT_NODES, server_list),
+    'known_dht_nodes': (list, DEFAULT_DHT_NODES, server_port),
     'lbryum_wallet_dir': (str, default_lbryum_dir),
     'max_connections_per_stream': (int, 5),
     'seek_head_blob_first': (bool, True),
@@ -277,11 +276,13 @@ ADJUSTABLE_SETTINGS = {
     'peer_port': (int, 3333),
     'pointtrader_server': (str, 'http://127.0.0.1:2424'),
     'reflector_port': (int, 5566),
-    # if reflect_uploads is True, send files to reflector (after publishing as well as a
-    # periodic check in the event the initial upload failed or was disconnected part way through
-    'reflect_uploads': (bool, True),
+    # if reflect_uploads is True, reflect files on publish
+    'reflect_uploads': (bool, False),
+    # if auto_re_reflect is True, attempt to re-reflect files on startup and
+    # at every auto_re_reflect_interval seconds, useful if initial reflect is unreliable
+    'auto_re_reflect': (bool, True),
     'auto_re_reflect_interval': (int, 3600),
-    'reflector_servers': (list, [('reflector2.lbry.io', 5566)], server_list),
+    'reflector_servers': (list, [('reflector2.lbry.io', 5566)], server_port),
     'run_reflector_server': (bool, False),
     'sd_download_timeout': (int, 3),
     'share_usage_data': (bool, True),  # whether to share usage stats and diagnostic info with LBRY
@@ -290,8 +291,6 @@ ADJUSTABLE_SETTINGS = {
     'use_upnp': (bool, True),
     'use_keyring': (bool, False),
     'wallet': (str, LBRYUM_WALLET),
-    'blockchain_name': (str, 'lbrycrd_main'),
-    'lbryum_servers': (list, [('lbryum8.lbry.io', 50001), ('lbryum9.lbry.io', 50001)], server_list)
 }
 
 
@@ -300,6 +299,7 @@ class Config(object):
                  environment=None, cli_settings=None):
 
         self._installation_id = None
+        # utils.generate_id(): 返回sha384(512随机数)哈希摘要
         self._session_id = base58.b58encode(utils.generate_id())
         self._node_id = None
 
@@ -319,22 +319,19 @@ class Config(object):
             TYPE_RUNTIME, TYPE_CLI, TYPE_ENV, TYPE_PERSISTED, TYPE_DEFAULT
         )
 
-        # types of data where user specified config values can be stored
-        self._user_specified = (
-            TYPE_RUNTIME, TYPE_CLI, TYPE_ENV, TYPE_PERSISTED
-        )
-
+        # 将固定和可变的配置都赋值给self._data[TYPE_DEFAULT]
         self._data[TYPE_DEFAULT].update(self._fixed_defaults)
         self._data[TYPE_DEFAULT].update(
             {k: v[1] for (k, v) in self._adjustable_defaults.iteritems()})
 
         if persisted_settings is None:
             persisted_settings = {}
-        self._validate_settings(persisted_settings)
+        self._validate_settings(persisted_settings)  # 验证传入参数的set(keys) 不能大于self._data[TYPE_DEFAULT]
         self._data[TYPE_PERSISTED].update(persisted_settings)
 
+        # 取出环境变量中ADJUSTABLE_SETTINGS属性的设置
         env_settings = self._parse_environment(environment)
-        self._validate_settings(env_settings)
+        self._validate_settings(env_settings)  # # 验证传入参数的set(keys) 不能大于self._data[TYPE_DEFAULT]的set(keys)
         self._data[TYPE_ENV].update(env_settings)
 
         if cli_settings is None:
@@ -392,37 +389,9 @@ class Config(object):
         if name in self._fixed_defaults:
             raise ValueError('{} is not an editable setting'.format(name))
 
-    def _assert_valid_setting_value(self, name, value):
-        if name == "max_key_fee":
-            currency = str(value["currency"]).upper()
-            if currency not in self._fixed_defaults['CURRENCIES'].keys():
-                raise InvalidCurrencyError(currency)
-        elif name == "download_directory":
-            directory = str(value)
-            if not os.path.exists(directory):
-                raise NoSuchDirectoryError(directory)
-
-    def is_default(self, name):
-        """Check if a config value is wasn't specified by the user
-
-        Args:
-            name: the name of the value to check
-
-        Returns: true if config value is the default one, false if it was specified by
-        the user
-
-        Sometimes it may be helpful to understand if a config value was specified
-        by the user or if it still holds its default value. This function will return
-        true when the config value is still the default. Note that when the user
-        specifies a value that is equal to the default one, it will still be considered
-        as 'user specified'
-        """
-
-        self._assert_valid_setting(name)
-        for possible_data_type in self._user_specified:
-            if name in self._data[possible_data_type]:
-                return False
-        return True
+    def _validate_currency(self, currency):
+        if currency not in self._fixed_defaults['CURRENCIES'].keys():
+            raise InvalidCurrencyError(currency)
 
     def get(self, name, data_type=None):
         """Get a config value
@@ -461,11 +430,13 @@ class Config(object):
         data types (e.g. PERSISTED values to save to a file, CLI values from parsed
         command-line options, etc), you can specify that with the data_types param
         """
-        self._assert_editable_setting(name)
-        self._assert_valid_setting_value(name, value)
+        if name == "max_key_fee":
+            currency = str(value["currency"]).upper()
+            self._validate_currency(currency)
 
+        self._assert_editable_setting(name)  # 断言name在可编辑配置中而又不在固定配置中
         for data_type in data_types:
-            self._assert_valid_data_type(data_type)
+            self._assert_valid_data_type(data_type)  # 断言数据类型在self._data中
             self._data[data_type][name] = value
 
     def update(self, updated_settings, data_types=(TYPE_RUNTIME,)):
@@ -488,37 +459,15 @@ class Config(object):
             }
 
     def save_conf_file_settings(self):
-        if conf_file:
-            path = conf_file
-        else:
-            path = self.get_conf_filename()
-
+        path = self.get_conf_filename()
         ext = os.path.splitext(path)[1]
         encoder = settings_encoders.get(ext, False)
         assert encoder is not False, 'Unknown settings format %s' % ext
         with open(path, 'w') as settings_file:
             settings_file.write(encoder(self._data[TYPE_PERSISTED]))
 
-    @staticmethod
-    def _convert_conf_file_lists(decoded):
-        converted = {}
-        for k, v in decoded.iteritems():
-            if k in ADJUSTABLE_SETTINGS and len(ADJUSTABLE_SETTINGS[k]) == 3:
-                converted[k] = ADJUSTABLE_SETTINGS[k][2](v)
-            else:
-                converted[k] = v
-        return converted
-
-    def initialize_post_conf_load(self):
-        settings.installation_id = settings.get_installation_id()
-        settings.node_id = settings.get_node_id()
-
     def load_conf_file_settings(self):
-        if conf_file:
-            path = conf_file
-        else:
-            path = self.get_conf_filename()
-
+        path = self.get_conf_filename()
         ext = os.path.splitext(path)[1]
         decoder = settings_decoders.get(ext, False)
         assert decoder is not False, 'Unknown settings format %s' % ext
@@ -528,12 +477,9 @@ class Config(object):
             decoded = self._fix_old_conf_file_settings(decoder(data))
             log.info('Loaded settings file: %s', path)
             self._validate_settings(decoded)
-            self._data[TYPE_PERSISTED].update(self._convert_conf_file_lists(decoded))
+            self._data[TYPE_PERSISTED].update(decoded)
         except (IOError, OSError) as err:
             log.info('%s: Failed to update settings from %s', err, path)
-
-        #initialize members depending on config file
-        self.initialize_post_conf_load()
 
     def _fix_old_conf_file_settings(self, settings_dict):
         if 'API_INTERFACE' in settings_dict:
@@ -557,6 +503,7 @@ class Config(object):
         # although there is a risk of a race condition here we don't
         # expect there to be multiple processes accessing this
         # directory so the risk can be ignored
+        # Config类重写了__getitem__,所以self[]这种形式可以从其各个属性中找值
         if not os.path.isdir(self['data_dir']):
             os.makedirs(self['data_dir'])
         return self['data_dir']
@@ -589,12 +536,13 @@ class Config(object):
             return yml_path
 
     def get_installation_id(self):
-        install_id_filename = os.path.join(self.ensure_data_dir(), "install_id")
+        install_id_filename = os.path.join(self.ensure_data_dir(), "install_id")  # lbry数据目录下的install_id文件(记录了安装id)
         if not self._installation_id:
             if os.path.isfile(install_id_filename):
                 with open(install_id_filename, "r") as install_id_file:
-                    self._installation_id = str(install_id_file.read()).strip()
+                    self._installation_id = install_id_file.read()
         if not self._installation_id:
+            # 和生成_session_id算法一样
             self._installation_id = base58.b58encode(utils.generate_id())
             with open(install_id_filename, "w") as install_id_file:
                 install_id_file.write(self._installation_id)
@@ -605,7 +553,7 @@ class Config(object):
         if not self._node_id:
             if os.path.isfile(node_id_filename):
                 with open(node_id_filename, "r") as node_id_file:
-                    self._node_id = base58.b58decode(str(node_id_file.read()).strip())
+                    self._node_id = base58.b58decode(node_id_file.read())
         if not self._node_id:
             self._node_id = utils.generate_id()
             with open(node_id_filename, "w") as node_id_file:
@@ -621,6 +569,9 @@ settings = None
 
 
 def get_default_env():
+    """ 把ADJUSTABLE_SETTINGS中的元组第二个值替换为None
+     然后作为参数传给Env来实例对象
+     """
     env_defaults = {}
     for k, v in ADJUSTABLE_SETTINGS.iteritems():
         if len(v) == 3:
@@ -633,7 +584,13 @@ def get_default_env():
 def initialize_settings(load_conf_file=True):
     global settings
     if settings is None:
+        # 将配置信息(固定的,可变的, 环境变量) 设置到Config的_data中
         settings = Config(FIXED_SETTINGS, ADJUSTABLE_SETTINGS,
                           environment=get_default_env())
+        # 找到lbry的install_id(如果没有,会在数据目录下生成install_id文件保存此id;如果有此文件, 则读取)
+        settings.installation_id = settings.get_installation_id()
+        # 节点id的生成方式和_session_id以及install_id一样(只是没有base58编码)
+        settings.node_id = settings.get_node_id()
         if load_conf_file:
+            # 加载数据目录下的配置文件(分两种yml或者json),如果没有手动配置,默认是不会存在的
             settings.load_conf_file_settings()

@@ -1,3 +1,4 @@
+#coding=utf-8
 from lbrynet.core import log_support
 
 import argparse
@@ -15,23 +16,14 @@ log = logging.getLogger(__name__)
 
 
 def test_internet_connection():
-    return utils.check_connection()
+    return utils.check_connection(server='baidu.com')
 
 
 def start():
     """The primary entry point for launching the daemon."""
-
-    # postpone loading the config file to after the CLI arguments
-    # have been parsed, as they may contain an alternate config file location
-    conf.initialize_settings(load_conf_file=False)
+    conf.initialize_settings()
 
     parser = argparse.ArgumentParser(description="Launch lbrynet-daemon")
-    parser.add_argument(
-        "--conf",
-        help="specify an alternative configuration file",
-        type=str,
-        default=None
-    )
     parser.add_argument(
         "--wallet",
         help="lbryum or ptc for testing, default lbryum",
@@ -56,9 +48,7 @@ def start():
     )
 
     args = parser.parse_args()
-    update_settings_from_args(args)
-
-    conf.settings.load_conf_file_settings()
+    update_settings_from_args(args)  # 将use_auth_http(useauth)和wallet的值更新到配置类Config的self._data['cli']中
 
     if args.version:
         version = system_info.get_platform(get_ip=False)
@@ -67,11 +57,12 @@ def start():
         return
 
     lbrynet_log = conf.settings.get_log_filename()
-    log_support.configure_logging(lbrynet_log, not args.quiet, args.verbose)
+    log_support.configure_logging(lbrynet_log, not args.quiet, args.verbose)  # 日志相关
     log.debug('Final Settings: %s', conf.settings.get_current_settings_dict())
 
     try:
         log.debug('Checking for an existing lbrynet daemon instance')
+        # 用于检查是否有lbrynet-daemon的服务开启
         JSONRPCProxy.from_url(conf.settings.get_api_connection_string()).status()
         log.info("lbrynet-daemon is already running")
         return
@@ -80,22 +71,20 @@ def start():
 
     log.info("Starting lbrynet-daemon from command line")
 
+    # 检查是否能够连接到internet
+    # (默认是以socket方式连接到lbry.io官网,可以改为国内网站,如baidu.com,如果成功则返回True)
     if test_internet_connection():
-        analytics_manager = analytics.Manager.new_instance()
+        analytics_manager = analytics.Manager.new_instance()  # 各种配置信息的初始化以及配置第三方的数据分析
         start_server_and_listen(args.useauth, analytics_manager)
-        reactor.run()
+        reactor.run()  # 事件循环管理器,单例reactor(异步回调也是事件触发)
     else:
         log.info("Not connected to internet, unable to start")
-
 
 def update_settings_from_args(args):
     conf.settings.update({
         'use_auth_http': args.useauth,
         'wallet': args.wallet,
     }, data_types=(conf.TYPE_CLI,))
-
-    conf.conf_file = args.conf
-
 
 @defer.inlineCallbacks
 def start_server_and_listen(use_auth, analytics_manager):
@@ -107,6 +96,7 @@ def start_server_and_listen(use_auth, analytics_manager):
     analytics_manager.send_server_startup()
     daemon_server = DaemonServer(analytics_manager)
     try:
+        # inlinecallbacks装饰器借助yield关键字来实现异步处理
         yield daemon_server.start(use_auth)
         analytics_manager.send_server_startup_success()
     except Exception as e:

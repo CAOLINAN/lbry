@@ -8,11 +8,6 @@ These instructions are for installing from source code, which is recommended if 
 
 Before starting, you'll need to install some additional libraries depending on your operating system.
 
-### Python
-
-LBRY requires Python 2.7. Python 3 is not supported.
-
-
 ### OS X Prerequisites
 
 Install [xcode command line tools](https://developer.xamarin.com/guides/testcloud/calabash/configuring/osx/install-xcode-command-line-tools/) and [homebrew](http://brew.sh/).
@@ -30,7 +25,7 @@ sudo pip install virtualenv
 On Ubuntu (we recommend 16.04), install the following:
 
 ```
-sudo apt-get install build-essential python2.7 python2.7-dev python-pip git python-virtualenv libssl-dev libffi-dev python-protobuf
+sudo apt-get install libgmp3-dev build-essential python2.7 python2.7-dev python-pip git python-virtualenv libssl-dev libffi-dev python-protobuf
 ```
 
 On Raspbian, you will also need to install `python-pyparsing`.
@@ -58,7 +53,10 @@ Currently, available binaries include:
 - Twisted
 - Zope.interface
 - pywin32
+- Yapsy
+- cx_Freeze
 - requests
+- gmpy
 
 Install the above binaries with `pip install *.whl`
 
@@ -76,8 +74,6 @@ To install:
  
  virtualenv lbry-venv
  source lbry-venv/bin/activate
- 
- python --version # Python 3 is not supported. Make sure you're on Python 2.7
  
  pip install -U -r requirements.txt
  pip install --editable .

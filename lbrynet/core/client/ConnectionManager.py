@@ -179,12 +179,8 @@ class ConnectionManager(object):
 
         # find peers for the head blob if configured to do so
         if self.seek_head_blob_first:
-            try:
-                peers = yield request_creator.get_new_peers_for_head_blob()
-                peers = self.return_shuffled_peers_not_connected_to(peers, new_conns_needed)
-            except KeyError:
-                log.warning("%s does not have a head blob", self._get_log_name())
-                peers = []
+            peers = yield request_creator.get_new_peers_for_head_blob()
+            peers = self.return_shuffled_peers_not_connected_to(peers, new_conns_needed)
         else:
             peers = []
 
@@ -200,7 +196,9 @@ class ConnectionManager(object):
                     self._get_log_name(), self._peer_connections.keys())
         log.debug("%s List of connection states: %s", self._get_log_name(),
                     [p_c_h.connection.state for p_c_h in self._peer_connections.values()])
+
         defer.returnValue(peers)
+
 
     def _connect_to_peer(self, peer):
         if self.stopped:

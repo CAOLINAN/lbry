@@ -2,12 +2,13 @@ from twisted.internet import defer, threads, error
 from twisted.trial import unittest
 
 from lbrynet import conf
-from lbrynet.core.StreamDescriptor import get_sd_info
+from lbrynet import lbry_file
 from lbrynet import reflector
 from lbrynet.core import BlobManager
 from lbrynet.core import PeerManager
 from lbrynet.core import Session
 from lbrynet.core import StreamDescriptor
+from lbrynet.lbry_file import EncryptedFileMetadataManager
 from lbrynet.lbry_file.client import EncryptedFileOptions
 from lbrynet.file_manager import EncryptedFileCreator
 from lbrynet.file_manager import EncryptedFileManager
@@ -20,6 +21,7 @@ class TestReflector(unittest.TestCase):
     def setUp(self):
         mocks.mock_conf_settings(self)
         self.session = None
+        self.stream_info_manager = None
         self.lbry_file_manager = None
         self.server_blob_manager = None
         self.reflector_port = None
@@ -64,8 +66,11 @@ class TestReflector(unittest.TestCase):
             external_ip="127.0.0.1"
         )
 
-        self.lbry_file_manager = EncryptedFileManager.EncryptedFileManager(self.session,
-                                                                           sd_identifier)
+        self.stream_info_manager = EncryptedFileMetadataManager.DBEncryptedFileMetadataManager(
+                                    self.db_dir)
+
+        self.lbry_file_manager = EncryptedFileManager.EncryptedFileManager(
+            self.session, self.stream_info_manager, sd_identifier)
 
         ## Setup reflector server classes ##
         self.server_db_dir, self.server_blob_dir = mk_db_and_blob_dir()
@@ -83,25 +88,26 @@ class TestReflector(unittest.TestCase):
             external_ip="127.0.0.1"
         )
 
-        self.server_blob_manager = BlobManager.DiskBlobManager(hash_announcer,
-                                                               self.server_blob_dir,
-                                                               self.server_session.storage)
+        self.server_blob_manager = BlobManager.DiskBlobManager(
+                                    hash_announcer, self.server_blob_dir, self.server_db_dir)
+        self.server_stream_info_manager = \
+            EncryptedFileMetadataManager.DBEncryptedFileMetadataManager(self.server_db_dir)
 
         self.server_lbry_file_manager = EncryptedFileManager.EncryptedFileManager(
-            self.server_session, sd_identifier)
+                                    self.server_session, self.server_stream_info_manager,
+                                    sd_identifier)
 
         d = self.session.setup()
+        d.addCallback(lambda _: self.stream_info_manager.setup())
         d.addCallback(lambda _: EncryptedFileOptions.add_lbry_file_to_sd_identifier(sd_identifier))
         d.addCallback(lambda _: self.lbry_file_manager.setup())
         d.addCallback(lambda _: self.server_session.setup())
         d.addCallback(lambda _: self.server_blob_manager.setup())
+        d.addCallback(lambda _: self.server_stream_info_manager.setup())
         d.addCallback(lambda _: self.server_lbry_file_manager.setup())
 
-        @defer.inlineCallbacks
-        def verify_equal(sd_info, stream_hash):
-            self.assertDictEqual(mocks.create_stream_sd_file, sd_info)
-            sd_hash = yield self.session.storage.get_sd_blob_hash_for_stream(stream_hash)
-            defer.returnValue(sd_hash)
+        def verify_equal(sd_info):
+            self.assertEqual(mocks.create_stream_sd_file, sd_info)
 
         def save_sd_blob_hash(sd_hash):
             self.sd_hash = sd_hash
@@ -109,8 +115,14 @@ class TestReflector(unittest.TestCase):
 
         def verify_stream_descriptor_file(stream_hash):
             self.stream_hash = stream_hash
-            d = get_sd_info(self.lbry_file_manager.session.storage, stream_hash, True)
-            d.addCallback(verify_equal, stream_hash)
+            d = lbry_file.get_sd_info(self.lbry_file_manager.stream_info_manager, stream_hash, True)
+            d.addCallback(verify_equal)
+            d.addCallback(
+                lambda _: lbry_file.publish_sd_blob(
+                    self.lbry_file_manager.stream_info_manager,
+                    self.session.blob_manager, stream_hash
+                )
+            )
             d.addCallback(save_sd_blob_hash)
             return d
 
@@ -124,12 +136,11 @@ class TestReflector(unittest.TestCase):
                 key="0123456701234567",
                 iv_generator=iv_generator()
             )
-            d.addCallback(lambda lbry_file: lbry_file.stream_hash)
             return d
 
         def start_server():
             server_factory = reflector.ServerFactory(
-                peer_manager, self.server_blob_manager,
+                peer_manager, self.server_blob_manager, self.server_stream_info_manager,
                 self.server_lbry_file_manager)
             from twisted.internet import reactor
             port = 8943
@@ -150,11 +161,13 @@ class TestReflector(unittest.TestCase):
         ## Close client classes ##
         d.addCallback(lambda _: self.lbry_file_manager.stop())
         d.addCallback(lambda _: self.session.shut_down())
+        d.addCallback(lambda _: self.stream_info_manager.stop())
 
         ## Close server classes ##
         d.addCallback(lambda _: self.server_blob_manager.stop())
         d.addCallback(lambda _: self.server_lbry_file_manager.stop())
         d.addCallback(lambda _: self.server_session.shut_down())
+        d.addCallback(lambda _: self.server_stream_info_manager.stop())
 
         d.addCallback(lambda _: self.reflector_port.stopListening())
 
@@ -179,32 +192,37 @@ class TestReflector(unittest.TestCase):
         @defer.inlineCallbacks
         def verify_stream_on_reflector():
             # check stream_info_manager has all the right information
-            streams = yield self.server_session.storage.get_all_streams()
+            streams = yield self.server_stream_info_manager.get_all_streams()
             self.assertEqual(1, len(streams))
             self.assertEqual(self.stream_hash, streams[0])
 
-            blobs = yield self.server_session.storage.get_blobs_for_stream(self.stream_hash)
-            blob_hashes = [b.blob_hash for b in blobs if b.blob_hash is not None]
+            blobs = yield self.server_stream_info_manager.get_blobs_for_stream(self.stream_hash)
+            blob_hashes = [b[0] for b in blobs if b[0] is not None]
             expected_blob_hashes = [b[0] for b in self.expected_blobs[:-1] if b[0] is not None]
             self.assertEqual(expected_blob_hashes, blob_hashes)
-            sd_hash = yield self.server_session.storage.get_sd_blob_hash_for_stream(streams[0])
+            sd_hashes = yield self.server_stream_info_manager.get_sd_blob_hashes_for_stream(
+                self.stream_hash)
+            self.assertEqual(1, len(sd_hashes))
             expected_sd_hash = self.expected_blobs[-1][0]
-            self.assertEqual(self.sd_hash, sd_hash)
+            self.assertEqual(self.sd_hash, sd_hashes[0])
 
             # check lbry file manager has the file
             files = yield self.server_lbry_file_manager.lbry_files
+            self.assertEqual(1, len(files))
+            self.assertEqual(self.sd_hash, files[0].sd_hash)
+            self.assertEqual('test_file', files[0].file_name)
 
-            self.assertEqual(0, len(files))
-
-            streams = yield self.server_lbry_file_manager.storage.get_all_streams()
-            self.assertEqual(1, len(streams))
-            stream_info = yield self.server_lbry_file_manager.storage.get_stream_info(self.stream_hash)
-            self.assertEqual(self.sd_hash, stream_info[3])
-            self.assertEqual('test_file'.encode('hex'), stream_info[0])
+            status = yield files[0].status()
+            self.assertEqual('stopped', status.running_status)
+            num_blobs = len(self.expected_blobs) -1 # subtract sd hash
+            self.assertEqual(num_blobs, status.num_completed)
+            self.assertEqual(num_blobs, status.num_known)
 
             # check should_announce blobs on blob_manager
-            blob_hashes = yield self.server_blob_manager.storage.get_all_should_announce_blobs()
-            self.assertSetEqual({self.sd_hash, expected_blob_hashes[0]}, set(blob_hashes))
+            blob_hashes = yield self.server_blob_manager._get_all_should_announce_blob_hashes()
+            self.assertEqual(2, len(blob_hashes))
+            self.assertTrue(self.sd_hash in blob_hashes)
+            self.assertTrue(expected_blob_hashes[0] in blob_hashes)
 
         def verify_have_blob(blob_hash, blob_size):
             d = self.server_blob_manager.get_blob(blob_hash)
@@ -213,7 +231,7 @@ class TestReflector(unittest.TestCase):
 
         def send_to_server():
             fake_lbry_file = mocks.FakeLBRYFile(self.session.blob_manager,
-                                                self.server_session.storage,
+                                                self.stream_info_manager,
                                                 self.stream_hash)
             factory = reflector.ClientFactory(fake_lbry_file)
 
@@ -265,10 +283,10 @@ class TestReflector(unittest.TestCase):
         @defer.inlineCallbacks
         def verify_stream_on_reflector():
             # this protocol should not have any impact on stream info manager
-            streams = yield self.server_session.storage.get_all_streams()
+            streams = yield self.server_stream_info_manager.get_all_streams()
             self.assertEqual(0, len(streams))
             # there should be no should announce blobs here
-            blob_hashes = yield self.server_blob_manager.storage.get_all_should_announce_blobs()
+            blob_hashes = yield self.server_blob_manager._get_all_should_announce_blob_hashes()
             self.assertEqual(0, len(blob_hashes))
 
         def verify_data_on_reflector():
@@ -315,21 +333,25 @@ class TestReflector(unittest.TestCase):
         def verify_stream_on_reflector():
             # check stream_info_manager has all the right information
 
-            streams = yield self.server_session.storage.get_all_streams()
+            streams = yield self.server_stream_info_manager.get_all_streams()
             self.assertEqual(1, len(streams))
             self.assertEqual(self.stream_hash, streams[0])
 
-            blobs = yield self.server_session.storage.get_blobs_for_stream(self.stream_hash)
-            blob_hashes = [b.blob_hash for b in blobs if b.blob_hash is not None]
+            blobs = yield self.server_stream_info_manager.get_blobs_for_stream(self.stream_hash)
+            blob_hashes = [b[0] for b in blobs if b[0] is not None]
             expected_blob_hashes = [b[0] for b in self.expected_blobs[:-1] if b[0] is not None]
             self.assertEqual(expected_blob_hashes, blob_hashes)
-            sd_hash = yield self.server_session.storage.get_sd_blob_hash_for_stream(
+            sd_hashes = yield self.server_stream_info_manager.get_sd_blob_hashes_for_stream(
                 self.stream_hash)
-            self.assertEqual(self.sd_hash, sd_hash)
+            self.assertEqual(1, len(sd_hashes))
+            expected_sd_hash = self.expected_blobs[-1][0]
+            self.assertEqual(self.sd_hash, sd_hashes[0])
 
             # check should_announce blobs on blob_manager
-            to_announce = yield self.server_blob_manager.storage.get_all_should_announce_blobs()
-            self.assertSetEqual(set(to_announce), {self.sd_hash, expected_blob_hashes[0]})
+            blob_hashes = yield self.server_blob_manager._get_all_should_announce_blob_hashes()
+            self.assertEqual(2, len(blob_hashes))
+            self.assertTrue(self.sd_hash in blob_hashes)
+            self.assertTrue(expected_blob_hashes[0] in blob_hashes)
 
         def verify_have_blob(blob_hash, blob_size):
             d = self.server_blob_manager.get_blob(blob_hash)
@@ -349,13 +371,14 @@ class TestReflector(unittest.TestCase):
 
         def send_to_server_as_stream(result):
             fake_lbry_file = mocks.FakeLBRYFile(self.session.blob_manager,
-                                                self.server_session.storage,
+                                                self.stream_info_manager,
                                                 self.stream_hash)
             factory = reflector.ClientFactory(fake_lbry_file)
 
             from twisted.internet import reactor
             reactor.connectTCP('localhost', self.port, factory)
             return factory.finished_deferred
+
 
         def verify_blob_completed(blob, blob_size):
             self.assertTrue(blob.get_is_verified())

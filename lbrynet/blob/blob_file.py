@@ -12,7 +12,6 @@ log = logging.getLogger(__name__)
 
 MAX_BLOB_SIZE = 2 * 2 ** 20
 
-
 class BlobFile(object):
     """
     A chunk of data available on the network which is specified by a hashsum

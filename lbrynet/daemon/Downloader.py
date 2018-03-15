@@ -5,7 +5,7 @@ from twisted.internet.task import LoopingCall
 
 from lbryschema.fee import Fee
 
-from lbrynet.core.Error import InsufficientFundsError, KeyFeeAboveMaxAllowed, InvalidStreamDescriptorError
+from lbrynet.core.Error import InsufficientFundsError, KeyFeeAboveMaxAllowed
 from lbrynet.core.Error import DownloadDataTimeout, DownloadCanceledError, DownloadSDTimeout
 from lbrynet.core.utils import safe_start_looping_call, safe_stop_looping_call
 from lbrynet.core.StreamDescriptor import download_sd_blob
@@ -31,13 +31,15 @@ log = logging.getLogger(__name__)
 
 class GetStream(object):
     def __init__(self, sd_identifier, session, exchange_rate_manager,
-                 max_key_fee, disable_max_key_fee, data_rate=None, timeout=None):
+                 max_key_fee, disable_max_key_fee, data_rate=None, timeout=None,
+                 file_name=None):
 
         self.timeout = timeout or conf.settings['download_timeout']
         self.data_rate = data_rate or conf.settings['data_rate']
         self.max_key_fee = max_key_fee or conf.settings['max_key_fee'][1]
         self.disable_max_key_fee = disable_max_key_fee or conf.settings['disable_max_key_fee']
         self.download_directory = conf.settings['download_directory']
+        self.file_name = file_name
         self.timeout_counter = 0
         self.code = None
         self.sd_hash = None
@@ -116,15 +118,15 @@ class GetStream(object):
         raise Exception('No suitable factory was found in {}'.format(factories))
 
     @defer.inlineCallbacks
-    def get_downloader(self, factory, stream_metadata, file_name=None):
+    def get_downloader(self, factory, stream_metadata):
         # TODO: we should use stream_metadata.options.get_downloader_options
         #       instead of hard-coding the options to be [self.data_rate]
         downloader = yield factory.make_downloader(
             stream_metadata,
-            self.data_rate,
+            [self.data_rate],
             self.payment_rate_manager,
-            self.download_directory,
-            file_name=file_name
+            download_directory=self.download_directory,
+            file_name=self.file_name
         )
         defer.returnValue(downloader)
 
@@ -166,10 +168,10 @@ class GetStream(object):
         defer.returnValue(key_fee)
 
     @defer.inlineCallbacks
-    def _create_downloader(self, sd_blob, file_name=None):
+    def _create_downloader(self, sd_blob):
         stream_metadata = yield self.sd_identifier.get_metadata_for_sd_blob(sd_blob)
         factory = self.get_downloader_factory(stream_metadata.factories)
-        downloader = yield self.get_downloader(factory, stream_metadata, file_name)
+        downloader = yield self.get_downloader(factory, stream_metadata)
         defer.returnValue(downloader)
 
     @defer.inlineCallbacks
@@ -179,16 +181,15 @@ class GetStream(object):
         defer.returnValue(sd_blob)
 
     @defer.inlineCallbacks
-    def _download(self, sd_blob, name, key_fee, txid, nout, file_name=None):
-        self.downloader = yield self._create_downloader(sd_blob, file_name=file_name)
+    def _download(self, sd_blob, name, key_fee):
+        self.downloader = yield self._create_downloader(sd_blob)
         yield self.pay_key_fee(key_fee, name)
-        yield self.session.storage.save_content_claim(self.downloader.stream_hash, "%s:%i" % (txid, nout))
         log.info("Downloading lbry://%s (%s) --> %s", name, self.sd_hash[:6], self.download_path)
         self.finished_deferred = self.downloader.start()
         self.finished_deferred.addCallbacks(lambda result: self.finish(result, name), self.fail)
 
     @defer.inlineCallbacks
-    def start(self, stream_info, name, txid, nout, file_name=None):
+    def start(self, stream_info, name):
         """
         Start download
 
@@ -203,12 +204,14 @@ class GetStream(object):
 
         safe_start_looping_call(self.checker, 1)
         self.set_status(DOWNLOAD_METADATA_CODE, name)
+        sd_blob = yield self._download_sd_blob()
+
+        yield self._download(sd_blob, name, key_fee)
+        self.set_status(DOWNLOAD_RUNNING_CODE, name)
+
         try:
-            sd_blob = yield self._download_sd_blob()
-            yield self._download(sd_blob, name, key_fee, txid, nout, file_name)
-            self.set_status(DOWNLOAD_RUNNING_CODE, name)
             yield self.data_downloading_deferred
-        except (DownloadDataTimeout, InvalidStreamDescriptorError) as err:
+        except DownloadDataTimeout as err:
             safe_stop_looping_call(self.checker)
             raise err
 

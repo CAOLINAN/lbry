@@ -1,8 +1,8 @@
+#coding=u8
 import logging
 import miniupnpc
 from lbrynet.core.BlobManager import DiskBlobManager
 from lbrynet.dht import node
-from lbrynet.database.storage import SQLiteStorage
 from lbrynet.core.PeerManager import PeerManager
 from lbrynet.core.RateLimiter import RateLimiter
 from lbrynet.core.client.DHTPeerFinder import DHTPeerFinder
@@ -23,18 +23,23 @@ class Session(object):
     associated with some hash. Usually, this means this peer has a
     blob identified by the hash in question, but it can be used for
     other purposes.
+    hash_announcer: 这将通知其他的peers，该peer与一些hash关联。
+    通常，这意味着这个peer有一个通过hash识别的blob，但是它可以用于其他目的。
 
-    the peer finder, which finds peers that are associated with some
-    hash.
+    the peer finder, which finds peers that are associated with some hash.
+    peer_finder: 找到某个peer关联的perrs
 
     the blob manager, which keeps track of which blobs have been
     downloaded and provides access to them,
+    blob_manager: 跟踪哪些blobs已被下载并提供对它们的访问
 
     the rate limiter, which attempts to ensure download and upload
     rates stay below a set maximum
+    rate_limiter: 尝试确保下载和上传率低于设定的最大值?
 
     upnp, which opens holes in compatible firewalls so that remote
     peers can connect to this peer.
+    upnp: 在兼容的防火墙中打开端口, 以便远程的peers能够连接到此peer
     """
 
     def __init__(self, blob_data_payment_rate, db_dir=None,
@@ -44,7 +49,7 @@ class Session(object):
                  blob_manager=None, peer_port=None, use_upnp=True,
                  rate_limiter=None, wallet=None,
                  dht_node_class=node.Node, blob_tracker_class=None,
-                 payment_rate_manager_class=None, is_generous=True, external_ip=None, storage=None):
+                 payment_rate_manager_class=None, is_generous=True, external_ip=None):
         """@param blob_data_payment_rate: The default payment rate for blob data
 
         @param db_dir: The directory in which levelDB files should be stored
@@ -137,10 +142,11 @@ class Session(object):
         self.payment_rate_manager = None
         self.payment_rate_manager_class = payment_rate_manager_class or NegotiatedPaymentRateManager
         self.is_generous = is_generous
-        self.storage = storage or SQLiteStorage(self.db_dir)
 
     def setup(self):
-        """Create the blob directory and database if necessary, start all desired services"""
+        """Create the blob directory and database if necessary, start all desired services
+        如果需要, 创建blob的目录和数据库, 开启所有所需的服务
+        """
 
         log.debug("Starting session.")
 
@@ -233,13 +239,11 @@ class Session(object):
                     # best not to rely on this external ip, the router can be behind layers of NATs
                     self.external_ip = external_ip
                 if self.peer_port:
-                    self.upnp_redirects.append(
-                        get_port_mapping(u, self.peer_port, 'TCP', 'LBRY peer port')
-                    )
+                    self.upnp_redirects.append(get_port_mapping(u, self.peer_port, 'TCP',
+                                                                'LBRY peer port'))
                 if self.dht_node_port:
-                    self.upnp_redirects.append(
-                        get_port_mapping(u, self.dht_node_port, 'UDP', 'LBRY DHT port')
-                    )
+                    self.upnp_redirects.append(get_port_mapping(u, self.dht_node_port, 'UDP',
+                                                                'LBRY DHT port'))
                 return True
             return False
 
@@ -251,10 +255,11 @@ class Session(object):
         d.addErrback(upnp_failed)
         return d
 
-    # the callback, if any, will be invoked once the joining procedure
-    # has terminated
-    def join_dht(self, cb=None):
+    def _setup_dht(self):
+        """DHT相关功能入口"""
         from twisted.internet import reactor
+
+        log.info("Starting DHT")
 
         def join_resolved_addresses(result):
             addresses = []
@@ -263,32 +268,16 @@ class Session(object):
                     addresses.append(value)
             return addresses
 
-        @defer.inlineCallbacks
-        def join_network(knownNodes):
-            log.debug("join DHT using known nodes: " + str(knownNodes))
-            result = yield self.dht_node.joinNetwork(knownNodes)
-            defer.returnValue(result)
+        def start_dht(join_network_result):
+            self.peer_finder.run_manage_loop()
+            self.hash_announcer.run_manage_loop()
+            return True
 
         ds = []
         for host, port in self.known_dht_nodes:
-            d = reactor.resolve(host)
+            d = reactor.resolve(host)  #reactor.resolve函数负责将将主机名转化为IP地址，该方法返回了一个已经激活的deferred
             d.addCallback(lambda h: (h, port))  # match host to port
             ds.append(d)
-
-        dl = defer.DeferredList(ds)
-        dl.addCallback(join_resolved_addresses)
-        dl.addCallback(join_network)
-        if cb:
-            dl.addCallback(cb)
-
-        return dl
-
-    def _setup_dht(self):
-        log.info("Starting DHT")
-
-        def start_dht(join_network_result):
-            self.hash_announcer.run_manage_loop()
-            return True
 
         self.dht_node = self.dht_node_class(
             udpPort=self.dht_node_port,
@@ -298,12 +287,13 @@ class Session(object):
         )
         self.peer_finder = DHTPeerFinder(self.dht_node, self.peer_manager)
         if self.hash_announcer is None:
-            self.hash_announcer = DHTHashAnnouncer(self.dht_node, self.peer_port)
+            self.hash_announcer = DHTHashAnnouncer(self.dht_node, self.peer_port)  # 这个类告诉DHT网络, 这个peer有哪些blobs
 
-        self.dht_node.startNetwork()
-
-        # pass start_dht() as callback to start the remaining components after joining the DHT
-        return self.join_dht(start_dht)
+        dl = defer.DeferredList(ds)
+        dl.addCallback(join_resolved_addresses)
+        dl.addCallback(self.dht_node.joinNetwork)
+        dl.addCallback(start_dht)
+        return dl
 
     def _setup_other_components(self):
         log.debug("Setting up the rest of the components")
@@ -316,25 +306,27 @@ class Session(object):
                 raise Exception(
                     "TempBlobManager is no longer supported, specify BlobManager or db_dir")
             else:
-                self.blob_manager = DiskBlobManager(
-                    self.hash_announcer, self.blob_dir, self.storage
-                )
+                self.blob_manager = DiskBlobManager(self.hash_announcer,
+                                                    self.blob_dir,
+                                                    self.db_dir)
 
         if self.blob_tracker is None:
-            self.blob_tracker = self.blob_tracker_class(
-                self.blob_manager, self.peer_finder, self.dht_node
-            )
+            self.blob_tracker = self.blob_tracker_class(self.blob_manager,
+                                                        self.peer_finder,
+                                                        self.dht_node)
         if self.payment_rate_manager is None:
             self.payment_rate_manager = self.payment_rate_manager_class(
-                self.base_payment_rate_manager, self.blob_tracker, self.is_generous
-            )
+                self.base_payment_rate_manager,
+                self.blob_tracker,
+                self.is_generous)
 
         self.rate_limiter.start()
-        d = self.storage.setup()
-        d.addCallback(lambda _: self.blob_manager.setup())
-        d.addCallback(lambda _: self.wallet.start())
-        d.addCallback(lambda _: self.blob_tracker.start())
-        return d
+        d1 = self.blob_manager.setup()
+        d2 = self.wallet.start()
+
+        dl = defer.DeferredList([d1, d2], fireOnOneErrback=True, consumeErrors=True)
+        dl.addCallback(lambda _: self.blob_tracker.start())
+        return dl
 
     def _unset_upnp(self):
         log.info("Unsetting upnp for session")

@@ -1,3 +1,4 @@
+#coding=utf-8
 import json
 import os
 import sys
@@ -38,22 +39,8 @@ def set_flag_vals(flag_names, parsed_args):
 
 
 def main():
-    argv = sys.argv[1:]
-
-    # check if a config file has been specified. If so, shift
-    # all the arguments so that the parsing can continue without
-    # noticing
-    if len(argv) and argv[0] == "--conf":
-        if len(argv) < 2:
-            print_error("No config file specified for --conf option")
-            print_help()
-            return
-
-        conf.conf_file = argv[1]
-        argv = argv[2:]
-
-    if len(argv):
-        method, args = argv[0], argv[1:]
+    if len(sys.argv[1:]):
+        method, args = sys.argv[1], sys.argv[2:]
     else:
         print_help()
         return
@@ -83,13 +70,17 @@ def main():
     else:
         flag_names = {}
 
-    parsed = docopt(fn.__doc__, args)
-    kwargs = set_flag_vals(flag_names, parsed)
-    colorama.init()
-    conf.initialize_settings()
-    api = LBRYAPIClient.get_client()
+    parsed = docopt(fn.__doc__, args)  # 第二个参数argv表示docopt不去系统的sys.argv[1:]而使用传入的参数
+    kwargs = set_flag_vals(flag_names, parsed)  # 取出有值的命令行参数(并且是排序的字典对象)
+    colorama.init()  # 终端颜色
+    # 将一些配置信息(conf.py中的固定的和可变的, 以及环境变量的和数据目录下配置文件的)设置为Config类的属性(_data属性)
+    conf.initialize_settings()  # 将配置信息设置到conf.py中的Config类
+    api = LBRYAPIClient.get_client()  # 根据配置中use_auth_http的值来决定api的类型
 
     try:
+        # api是JSONRPCProxy对象
+        # status是通过__getattr__来实现访问的
+        # 把status作为JSONRPCProxy类的_serviceName属性,重新实例化JSONRPCProxy对象并访问rpc服务
         status = api.status()
     except URLError as err:
         if isinstance(err, HTTPError) and err.code == UNAUTHORIZED:
@@ -143,7 +134,7 @@ def main():
 
             print_help_for_command(method)
         elif isinstance(err, RPCError):
-            print_error(err.msg, suggest_help=False)
+            print_error(err.msg, suggest_help=True)
             # print_help_for_command(method)
         else:
             print_error("Something went wrong\n", suggest_help=False)
@@ -185,19 +176,22 @@ def print_error(message, suggest_help=True):
 
 
 def print_help():
+    commands = Daemon.callable_methods.keys()
     print "\n".join([
         "NAME",
         "   lbrynet-cli - LBRY command line client.",
         "",
         "USAGE",
-        "   lbrynet-cli [--conf <config file>] <command> [<args>]",
+        "   lbrynet-cli <command> [<args>]",
         "",
         "EXAMPLES",
-        "   lbrynet-cli commands                 # list available commands",
-        "   lbrynet-cli status                   # get daemon status",
-        "   lbrynet-cli --conf ~/l1.conf status  # like above but using ~/l1.conf as config file",
-        "   lbrynet-cli resolve_name what        # resolve a name",
-        "   lbrynet-cli help resolve_name        # get help for a command",
+        "   lbrynet-cli commands            # list available commands",
+        "   lbrynet-cli status              # get daemon status",
+        "   lbrynet-cli resolve_name what   # resolve a name",
+        "   lbrynet-cli help resolve_name   # get help for a command",
+        "",
+        "COMMANDS",
+        wrap_list_to_term_width(commands, prefix='   ')
     ])
 
 

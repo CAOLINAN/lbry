@@ -1,3 +1,4 @@
+#coding=u8
 import collections
 import logging
 from twisted.internet import defer, task
@@ -20,16 +21,17 @@ NEW_CHANNEL = 'New Channel'
 CREDITS_SENT = 'Credits Sent'
 
 BLOB_BYTES_UPLOADED = 'Blob Bytes Uploaded'
+BLOB_BYTES_AVAILABLE = 'Blob Bytes Available'
 
 log = logging.getLogger(__name__)
 
 
 class Manager(object):
     def __init__(self, analytics_api, context=None, installation_id=None, session_id=None):
-        self.analytics_api = analytics_api
-        self._tracked_data = collections.defaultdict(list)
-        self.looping_call_manager = self._setup_looping_calls()
-        self.context = context or self._make_context(
+        self.analytics_api = analytics_api  # 本模块Api类实例: 用于用户数据分析(segment.io)和共享统计信息和诊断信息
+        self._tracked_data = collections.defaultdict(list)  # 默认值为list的字典
+        self.looping_call_manager = self._setup_looping_calls()  # 循环调用管理类(属性calls(字典),保存了 调用名称:调用方法)
+        self.context = context or self._make_context(  # 版本信息上下文(系统版本, lbryum版本等等)
             system_info.get_platform(), conf.settings['wallet'])
         self.installation_id = installation_id or conf.settings.installation_id
         self.session_id = session_id or conf.settings.get_session_id()
@@ -37,6 +39,9 @@ class Manager(object):
 
     @classmethod
     def new_instance(cls, enabled=None):
+        # Api是一个普通类, 其属性包含了txrequests对象, 和segment.com网站api访问信息
+        # txrequests: 通过twisted实现的异步requests
+        # segment.com: 第三方网站, 用于分析客户数据(提供api上传数据接口, 有200+的工具供客户使用)
         api = Api.new_instance(enabled)
         return cls(api)
 
@@ -99,14 +104,16 @@ class Manager(object):
         lcall.start(frequency)
 
     def _get_looping_calls(self):
+        """被循环调用的方法"""
         return [
-            ('send_heartbeat', self._send_heartbeat, 60),
+            ('send_heartbeat', self._send_heartbeat, 60),  # 发送心跳
             ('update_tracked_metrics', self._update_tracked_metrics, 300),
         ]
 
     def _setup_looping_calls(self):
         call_manager = looping_call_manager.LoopingCallManager()
         for name, fn, _ in self._get_looping_calls():
+            # task.LoopingCall: 是twisted中循环调用一个方法
             call_manager.register_looping_call(name, task.LoopingCall(fn))
         return call_manager
 
@@ -257,11 +264,15 @@ class Api(object):
     @classmethod
     def new_instance(cls, enabled=None):
         """Initialize an instance using values from the configuration"""
+        # Session是requests库的twisted的异步版本
         session = Session()
         if enabled is None:
+            # 是否与LBRY共享使用统计信息和诊断信息。
             enabled = conf.settings['share_usage_data']
         return cls(
             session,
+            # 下面这两个配置的值是https://segment.com/网站的api访问
+            # 此站是网站主上传用户数据后, 可提供200+的工具用于数据分析
             conf.settings['ANALYTICS_ENDPOINT'],
             utils.deobfuscate(conf.settings['ANALYTICS_TOKEN']),
             enabled,

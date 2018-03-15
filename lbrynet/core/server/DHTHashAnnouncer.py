@@ -1,3 +1,4 @@
+#coding=utf-8
 import binascii
 import collections
 import logging
@@ -12,8 +13,8 @@ log = logging.getLogger(__name__)
 class DHTHashAnnouncer(object):
     ANNOUNCE_CHECK_INTERVAL = 60
     CONCURRENT_ANNOUNCERS = 5
-
     """This class announces to the DHT that this peer has certain blobs"""
+    """ 这个类告诉DHT网络, 这个peer有哪些blobs """
     def __init__(self, dht_node, peer_port):
         self.dht_node = dht_node
         self.peer_port = peer_port

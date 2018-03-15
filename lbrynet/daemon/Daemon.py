@@ -1,3 +1,4 @@
+#coding=utf-8
 import binascii
 import logging.handlers
 import mimetypes
@@ -23,14 +24,15 @@ from lbryschema.decode import smart_decode
 
 # TODO: importing this when internet is disabled raises a socket.gaierror
 from lbrynet.core.system_info import get_lbrynet_version
-from lbrynet.database.storage import SQLiteStorage
-from lbrynet import conf
+from lbrynet import conf, analytics
 from lbrynet.conf import LBRYCRD_WALLET, LBRYUM_WALLET, PTC_WALLET
 from lbrynet.reflector import reupload
 from lbrynet.reflector import ServerFactory as reflector_server_factory
 from lbrynet.core.log_support import configure_loggly_handler
 from lbrynet.lbry_file.client.EncryptedFileDownloader import EncryptedFileSaverFactory
 from lbrynet.lbry_file.client.EncryptedFileOptions import add_lbry_file_to_sd_identifier
+from lbrynet.lbry_file.EncryptedFileMetadataManager import DBEncryptedFileMetadataManager
+from lbrynet.lbry_file.StreamDescriptor import EncryptedFileStreamType
 from lbrynet.file_manager.EncryptedFileManager import EncryptedFileManager
 from lbrynet.daemon.Downloader import GetStream
 from lbrynet.daemon.Publisher import Publisher
@@ -39,18 +41,16 @@ from lbrynet.daemon.auth.server import AuthJSONRPCServer
 from lbrynet.core.PaymentRateManager import OnlyFreePaymentsManager
 from lbrynet.core import utils, system_info
 from lbrynet.core.StreamDescriptor import StreamDescriptorIdentifier, download_sd_blob
-from lbrynet.core.StreamDescriptor import EncryptedFileStreamType
 from lbrynet.core.Session import Session
-from lbrynet.core.Wallet import LBRYumWallet, ClaimOutpoint
+from lbrynet.core.Wallet import LBRYumWallet, SqliteStorage, ClaimOutpoint
 from lbrynet.core.looping_call_manager import LoopingCallManager
 from lbrynet.core.server.BlobRequestHandler import BlobRequestHandlerFactory
 from lbrynet.core.server.ServerProtocol import ServerProtocolFactory
-from lbrynet.core.Error import InsufficientFundsError, UnknownNameError
-from lbrynet.core.Error import DownloadDataTimeout, DownloadSDTimeout
+from lbrynet.core.Error import InsufficientFundsError, UnknownNameError, NoSuchSDHash
+from lbrynet.core.Error import NoSuchStreamHash, DownloadDataTimeout, DownloadSDTimeout
 from lbrynet.core.Error import NullFundsError, NegativeFundsError
 from lbrynet.core.Peer import Peer
 from lbrynet.core.SinglePeerDownloader import SinglePeerDownloader
-from lbrynet.core.client.StandaloneBlobDownloader import StandaloneBlobDownloader
 
 log = logging.getLogger(__name__)
 
@@ -61,7 +61,6 @@ LOADING_FILE_MANAGER_CODE = 'loading_file_manager'
 LOADING_SERVER_CODE = 'loading_server'
 STARTED_CODE = 'started'
 WAITING_FOR_FIRST_RUN_CREDITS = 'waiting_for_credits'
-WAITING_FOR_UNLOCK = 'waiting_for_wallet_unlock'
 STARTUP_STAGES = [
     (INITIALIZING_CODE, 'Initializing'),
     (LOADING_DB_CODE, 'Loading databases'),
@@ -70,7 +69,6 @@ STARTUP_STAGES = [
     (LOADING_SERVER_CODE, 'Starting lbrynet'),
     (STARTED_CODE, 'Started lbrynet'),
     (WAITING_FOR_FIRST_RUN_CREDITS, 'Waiting for first run credits'),
-    (WAITING_FOR_UNLOCK, 'Waiting for user to unlock the wallet using the wallet_unlock command')
 ]
 
 # TODO: make this consistent with the stages in Downloader.py
@@ -94,7 +92,6 @@ CONNECTION_MESSAGES = {
 }
 
 SHORT_ID_LEN = 20
-MAX_UPDATE_FEE_ESTIMATE = 0.3
 
 
 class IterableContainer(object):
@@ -122,13 +119,6 @@ class _FileID(IterableContainer):
     FILE_NAME = 'file_name'
     STREAM_HASH = 'stream_hash'
     ROWID = "rowid"
-    CLAIM_ID = "claim_id"
-    OUTPOINT = "outpoint"
-    TXID = "txid"
-    NOUT = "nout"
-    CHANNEL_CLAIM_ID = "channel_claim_id"
-    CLAIM_NAME = "claim_name"
-    CHANNEL_NAME = "channel_name"
 
 
 FileID = _FileID()
@@ -162,9 +152,20 @@ class AlwaysSend(object):
         return d
 
 
+# If an instance has a lot of blobs, this call might get very expensive.
+# For reflector, with 50k blobs, it definitely has an impact on the first run
+# But doesn't seem to impact performance after that.
+@defer.inlineCallbacks
+def calculate_available_blob_size(blob_manager):
+    blob_hashes = yield blob_manager.get_all_verified_blobs()
+    blobs = yield defer.DeferredList([blob_manager.get_blob(b) for b in blob_hashes])
+    defer.returnValue(sum(b.length for success, b in blobs if success and b.length))
+
+
 class Daemon(AuthJSONRPCServer):
     """
     LBRYnet daemon, a jsonrpc interface to lbry functions
+    一个lbry方法的jsonrpc接口
     """
 
     allowed_during_startup = [
@@ -174,7 +175,6 @@ class Daemon(AuthJSONRPCServer):
     def __init__(self, analytics_manager):
         AuthJSONRPCServer.__init__(self, conf.settings['use_auth_http'])
         self.db_dir = conf.settings['data_dir']
-        self.storage = SQLiteStorage(self.db_dir)
         self.download_directory = conf.settings['download_directory']
         if conf.settings['BLOBFILES_DIR'] == "blobfiles":
             self.blobfile_dir = os.path.join(self.db_dir, "blobfiles")
@@ -198,7 +198,7 @@ class Daemon(AuthJSONRPCServer):
         self.connected_to_internet = True
         self.connection_status_code = None
         self.platform = None
-        self.current_db_revision = 6
+        self.current_db_revision = 5
         self.db_revision_file = conf.settings.get_db_revision_filename()
         self.session = None
         self._session_id = conf.settings.get_session_id()
@@ -221,47 +221,46 @@ class Daemon(AuthJSONRPCServer):
         }
         self.looping_call_manager = LoopingCallManager(calls)
         self.sd_identifier = StreamDescriptorIdentifier()
+        self.stream_info_manager = None
         self.lbry_file_manager = None
 
     @defer.inlineCallbacks
     def setup(self):
+        #twisted.internet.base.ReactorBase.addSystemEventTrigger
+        # 应该是注册一些业务逻辑无关的系统事件
         reactor.addSystemEventTrigger('before', 'shutdown', self._shutdown)
 
-        configure_loggly_handler()
+        configure_loggly_handler()  # 日志相关
+
+        @defer.inlineCallbacks
+        def _announce_startup():
+            def _announce():
+                self.announced_startup = True
+                self.startup_status = STARTUP_STAGES[5]
+                log.info("Started lbrynet-daemon")
+                log.info("%i blobs in manager", len(self.session.blob_manager.blobs))
+
+            yield _announce()
 
         log.info("Starting lbrynet-daemon")
 
         self.looping_call_manager.start(Checker.INTERNET_CONNECTION, 3600)
         self.looping_call_manager.start(Checker.CONNECTION_STATUS, 30)
+        # LBC/BTC/USD 汇率查询
         self.exchange_rate_manager.start()
 
-        yield self._initial_setup()
-        yield threads.deferToThread(self._setup_data_directory)
-        migrated = yield self._check_db_migration()
-        yield self.storage.setup()
-        yield self._get_session()
-        yield self._check_wallet_locked()
-        yield self._start_analytics()
+        yield self._initial_setup()  # 显示系统信息lbrynet.daemon.Daemon:273: Platform
+        yield threads.deferToThread(self._setup_data_directory)  # 使同步函数实现非阻塞(开启了新线程)
+        yield self._check_db_migration()  # 检查数据文件版本是否兼容当前应用
+        yield self._get_session()  # 初始化一些与钱包/DHT相关的信息(并且以异步方式启动DHT的服务)
+        yield self._get_analytics()
         yield add_lbry_file_to_sd_identifier(self.sd_identifier)
         yield self._setup_stream_identifier()
         yield self._setup_lbry_file_manager()
         yield self._setup_query_handlers()
         yield self._setup_server()
         log.info("Starting balance: " + str(self.session.wallet.get_balance()))
-        self.announced_startup = True
-        self.startup_status = STARTUP_STAGES[5]
-        log.info("Started lbrynet-daemon")
-
-        ###
-        # this should be removed with the next db revision
-        if migrated:
-            missing_channel_claim_ids = yield self.storage.get_unknown_certificate_ids()
-            while missing_channel_claim_ids:  # in case there are a crazy amount lets batch to be safe
-                batch = missing_channel_claim_ids[:100]
-                _ = yield self.session.wallet.get_claims_by_ids(*batch)
-                missing_channel_claim_ids = missing_channel_claim_ids[100:]
-        ###
-
+        yield _announce_startup()
         self._auto_renew()
 
     def _get_platform(self):
@@ -330,6 +329,7 @@ class Daemon(AuthJSONRPCServer):
                 reflector_factory = reflector_server_factory(
                     self.session.peer_manager,
                     self.session.blob_manager,
+                    self.stream_info_manager,
                     self.lbry_file_manager
                 )
                 try:
@@ -455,9 +455,14 @@ class Daemon(AuthJSONRPCServer):
                     conf.settings.update({key: decoded},
                                          data_types=(conf.TYPE_RUNTIME, conf.TYPE_PERSISTED))
                 else:
-                    converted = setting_type(settings[key])
-                    conf.settings.update({key: converted},
-                                            data_types=(conf.TYPE_RUNTIME, conf.TYPE_PERSISTED))
+                    try:
+                        converted = setting_type(settings[key])
+                        conf.settings.update({key: converted},
+                                             data_types=(conf.TYPE_RUNTIME, conf.TYPE_PERSISTED))
+                    except Exception as err:
+                        log.warning(err.message)
+                        log.warning("error converting setting '%s' to type %s from type %s", key,
+                                    setting_type, str(type(settings[key])))
         conf.settings.save_conf_file_settings()
 
         self.data_rate = conf.settings['data_rate']
@@ -487,65 +492,67 @@ class Daemon(AuthJSONRPCServer):
             log.debug("Created the blobfile directory: %s", str(self.blobfile_dir))
         if not os.path.exists(self.db_revision_file):
             log.warning("db_revision file not found. Creating it")
-            self._write_db_revision_file(self.current_db_revision)
+            self._write_db_revision_file(old_revision)
 
-    @defer.inlineCallbacks
     def _check_db_migration(self):
         old_revision = 1
-        migrated = False
         if os.path.exists(self.db_revision_file):
-            with open(self.db_revision_file, "r") as revision_read_handle:
-                old_revision = int(revision_read_handle.read().strip())
+            old_revision = int(open(self.db_revision_file).read().strip())
 
         if old_revision > self.current_db_revision:
             raise Exception('This version of lbrynet is not compatible with the database\n'
                             'Your database is revision %i, expected %i' %
                             (old_revision, self.current_db_revision))
-        if old_revision < self.current_db_revision:
-            from lbrynet.database.migrator import dbmigrator
-            log.info("Upgrading your databases (revision %i to %i)", old_revision, self.current_db_revision)
-            yield threads.deferToThread(
-                dbmigrator.migrate_db, self.db_dir, old_revision, self.current_db_revision
-            )
+
+        def update_version_file_and_print_success():
             self._write_db_revision_file(self.current_db_revision)
             log.info("Finished upgrading the databases.")
-            migrated = True
-        defer.returnValue(migrated)
+
+        if old_revision < self.current_db_revision:
+            from lbrynet.db_migrator import dbmigrator
+            log.info("Upgrading your databases")
+            d = threads.deferToThread(
+                dbmigrator.migrate_db, self.db_dir, old_revision, self.current_db_revision)
+            d.addCallback(lambda _: update_version_file_and_print_success())
+            return d
+        return defer.succeed(True)
 
     @defer.inlineCallbacks
     def _setup_lbry_file_manager(self):
-        log.info('Starting the file manager')
+        log.info('Starting to setup up file manager')
         self.startup_status = STARTUP_STAGES[3]
-        self.lbry_file_manager = EncryptedFileManager(self.session, self.sd_identifier)
+        self.stream_info_manager = DBEncryptedFileMetadataManager(self.db_dir)
+        self.lbry_file_manager = EncryptedFileManager(
+            self.session,
+            self.stream_info_manager,
+            self.sd_identifier,
+            download_directory=self.download_directory
+        )
         yield self.lbry_file_manager.setup()
         log.info('Done setting up file manager')
 
-    def _start_analytics(self):
+    def _get_analytics(self):
         if not self.analytics_manager.is_started:
             self.analytics_manager.start()
+            self.analytics_manager.register_repeating_metric(
+                analytics.BLOB_BYTES_AVAILABLE,
+                AlwaysSend(calculate_available_blob_size, self.session.blob_manager),
+                frequency=300
+            )
 
     def _get_session(self):
         def get_wallet():
             if self.wallet_type == LBRYCRD_WALLET:
                 raise ValueError('LBRYcrd Wallet is no longer supported')
             elif self.wallet_type == LBRYUM_WALLET:
-
                 log.info("Using lbryum wallet")
-
-                lbryum_servers = {address: {'t': str(port)}
-                                  for address, port in conf.settings['lbryum_servers']}
-
-                config = {
-                    'auto_connect': True,
-                    'chain': conf.settings['blockchain_name'],
-                    'default_servers': lbryum_servers
-                }
-
+                config = {'auto_connect': True}
                 if 'use_keyring' in conf.settings:
                     config['use_keyring'] = conf.settings['use_keyring']
                 if conf.settings['lbryum_wallet_dir']:
                     config['lbryum_path'] = conf.settings['lbryum_wallet_dir']
-                wallet = LBRYumWallet(self.storage, config)
+                storage = SqliteStorage(self.db_dir)
+                wallet = LBRYumWallet(storage, config)
                 return defer.succeed(wallet)
             elif self.wallet_type == PTC_WALLET:
                 log.info("Using PTC wallet")
@@ -568,8 +575,7 @@ class Daemon(AuthJSONRPCServer):
                 use_upnp=self.use_upnp,
                 wallet=wallet,
                 is_generous=conf.settings['is_generous_host'],
-                external_ip=self.platform['ip'],
-                storage=self.storage
+                external_ip=self.platform['ip']
             )
             self.startup_status = STARTUP_STAGES[2]
 
@@ -577,20 +583,12 @@ class Daemon(AuthJSONRPCServer):
         d.addCallback(lambda _: self.session.setup())
         return d
 
-    @defer.inlineCallbacks
-    def _check_wallet_locked(self):
-        wallet = self.session.wallet
-        if wallet.wallet.use_encryption:
-            self.startup_status = STARTUP_STAGES[7]
-
-        yield wallet.check_locked()
-
     def _setup_stream_identifier(self):
         file_saver_factory = EncryptedFileSaverFactory(
             self.session.peer_finder,
             self.session.rate_limiter,
             self.session.blob_manager,
-            self.session.storage,
+            self.stream_info_manager,
             self.session.wallet,
             self.download_directory
         )
@@ -613,17 +611,13 @@ class Daemon(AuthJSONRPCServer):
 
         rate_manager = rate_manager or self.session.payment_rate_manager
         timeout = timeout or 30
-        downloader = StandaloneBlobDownloader(
-            blob_hash, self.session.blob_manager, self.session.peer_finder, self.session.rate_limiter,
-            rate_manager, self.session.wallet, timeout
-        )
-        return downloader.download()
+        return download_sd_blob(self.session, blob_hash, rate_manager, timeout)
 
     @defer.inlineCallbacks
     def _get_stream_analytics_report(self, claim_dict):
         sd_hash = claim_dict.source_hash
         try:
-            stream_hash = yield self.session.storage.get_stream_hash_for_sd_hash(sd_hash)
+            stream_hash = yield self.stream_info_manager.get_stream_hash_for_sd_hash(sd_hash)
         except Exception:
             stream_hash = None
         report = {
@@ -637,7 +631,7 @@ class Daemon(AuthJSONRPCServer):
             sd_host = None
         report["sd_blob"] = sd_host
         if stream_hash:
-            blob_infos = yield self.session.storage.get_blobs_for_stream(stream_hash)
+            blob_infos = yield self.stream_info_manager.get_blobs_for_stream(stream_hash)
             report["known_blobs"] = len(blob_infos)
         else:
             blob_infos = []
@@ -681,15 +675,15 @@ class Daemon(AuthJSONRPCServer):
             self.streams[sd_hash] = GetStream(self.sd_identifier, self.session,
                                               self.exchange_rate_manager, self.max_key_fee,
                                               self.disable_max_key_fee,
-                                              conf.settings['data_rate'], timeout)
+                                              conf.settings['data_rate'], timeout,
+                                              file_name)
             try:
-                lbry_file, finished_deferred = yield self.streams[sd_hash].start(
-                    claim_dict, name, txid, nout, file_name
-                )
-                finished_deferred.addCallbacks(
-                    lambda _: _download_finished(download_id, name, claim_dict),
-                    lambda e: _download_failed(e, download_id, name, claim_dict)
-                )
+                lbry_file, finished_deferred = yield self.streams[sd_hash].start(claim_dict, name)
+                yield self.stream_info_manager.save_outpoint_to_file(lbry_file.rowid, txid, nout)
+                finished_deferred.addCallbacks(lambda _: _download_finished(download_id, name,
+                                                                            claim_dict),
+                                               lambda e: _download_failed(e, download_id, name,
+                                                                          claim_dict))
                 result = yield self._get_lbry_file_dict(lbry_file, full_status=True)
             except Exception as err:
                 yield _download_failed(err, download_id, name, claim_dict)
@@ -711,9 +705,10 @@ class Daemon(AuthJSONRPCServer):
         publisher = Publisher(self.session, self.lbry_file_manager, self.session.wallet,
                               certificate_id)
         parse_lbry_uri(name)
+        if bid <= 0.0:
+            raise Exception("Invalid bid")
         if not file_path:
-            stream_hash = yield self.storage.get_stream_hash_for_sd_hash(claim_dict['stream']['source']['source'])
-            claim_out = yield publisher.publish_stream(name, bid, claim_dict, stream_hash, claim_address,
+            claim_out = yield publisher.publish_stream(name, bid, claim_dict, claim_address,
                                                        change_address)
         else:
             claim_out = yield publisher.create_and_publish_stream(name, bid, claim_dict, file_path,
@@ -722,6 +717,9 @@ class Daemon(AuthJSONRPCServer):
                 d = reupload.reflect_stream(publisher.lbry_file)
                 d.addCallbacks(lambda _: log.info("Reflected new publication to lbry://%s", name),
                                log.exception)
+        yield self.stream_info_manager.save_outpoint_to_file(publisher.lbry_file.rowid,
+                                                             claim_out['txid'],
+                                                             int(claim_out['nout']))
         self.analytics_manager.send_claim_action('publish')
         log.info("Success! Published to lbry://%s txid: %s nout: %d", name, claim_out['txid'],
                  claim_out['nout'])
@@ -877,7 +875,7 @@ class Daemon(AuthJSONRPCServer):
         else:
             written_bytes = 0
 
-        size = num_completed = num_known = status = None
+        size = outpoint = num_completed = num_known = status = None
 
         if full_status:
             size = yield lbry_file.get_total_bytes()
@@ -885,6 +883,7 @@ class Daemon(AuthJSONRPCServer):
             num_completed = file_status.num_completed
             num_known = file_status.num_known
             status = file_status.running_status
+            outpoint = yield self.stream_info_manager.get_file_outpoint(lbry_file.rowid)
 
         result = {
             'completed': lbry_file.completed,
@@ -904,14 +903,7 @@ class Daemon(AuthJSONRPCServer):
             'blobs_completed': num_completed,
             'blobs_in_stream': num_known,
             'status': status,
-            'claim_id': lbry_file.claim_id,
-            'txid': lbry_file.txid,
-            'nout': lbry_file.nout,
-            'outpoint': lbry_file.outpoint,
-            'metadata': lbry_file.metadata,
-            'channel_claim_id': lbry_file.channel_claim_id,
-            'channel_name': lbry_file.channel_name,
-            'claim_name': lbry_file.claim_name
+            'outpoint': outpoint
         }
         defer.returnValue(result)
 
@@ -930,7 +922,7 @@ class Daemon(AuthJSONRPCServer):
         defer.returnValue(lbry_file)
 
     @defer.inlineCallbacks
-    def _get_lbry_files(self, return_json=False, full_status=True, **kwargs):
+    def _get_lbry_files(self, return_json=False, full_status=False, **kwargs):
         lbry_files = list(self.lbry_file_manager.lbry_files)
         if kwargs:
             for search_type, value in iter_lbry_file_search_values(kwargs):
@@ -943,6 +935,27 @@ class Daemon(AuthJSONRPCServer):
             lbry_files = file_dicts
         log.debug("Collected %i lbry files", len(lbry_files))
         defer.returnValue(lbry_files)
+
+    # TODO: do this and get_blobs_for_sd_hash in the stream info manager
+    def get_blobs_for_stream_hash(self, stream_hash):
+        def _iter_blobs(blob_hashes):
+            for blob_hash, blob_num, blob_iv, blob_length in blob_hashes:
+                if blob_hash:
+                    yield self.session.blob_manager.get_blob(blob_hash, length=blob_length)
+
+        def _get_blobs(blob_hashes):
+            dl = defer.DeferredList(list(_iter_blobs(blob_hashes)), consumeErrors=True)
+            dl.addCallback(lambda blobs: [blob[1] for blob in blobs if blob[0]])
+            return dl
+
+        d = self.stream_info_manager.get_blobs_for_stream(stream_hash)
+        d.addCallback(_get_blobs)
+        return d
+
+    def get_blobs_for_sd_hash(self, sd_hash):
+        d = self.stream_info_manager.get_stream_hash_for_sd_hash(sd_hash)
+        d.addCallback(self.get_blobs_for_stream_hash)
+        return d
 
     def _get_single_peer_downloader(self):
         downloader = SinglePeerDownloader()
@@ -997,16 +1010,17 @@ class Daemon(AuthJSONRPCServer):
     ############################################################################
 
     @defer.inlineCallbacks
+    @AuthJSONRPCServer.flags(session_status="-s", dht_status="-d")
     def jsonrpc_status(self, session_status=False, dht_status=False):
         """
         Get daemon status
 
         Usage:
-            status [--session_status] [--dht_status]
+            status [-s] [-d]
 
         Options:
-            --session_status  : (bool) include session status in results
-            --dht_status  : (bool) include dht network and peer status
+            -s  : include session status in results
+            -d  : include dht network and peer status
 
         Returns:
             (dict) lbrynet-daemon status
@@ -1106,9 +1120,6 @@ class Daemon(AuthJSONRPCServer):
         Usage:
             version
 
-        Options:
-            None
-
         Returns:
             (dict) Dictionary of lbry version information
             {
@@ -1129,16 +1140,12 @@ class Daemon(AuthJSONRPCServer):
         log.info("Get version info: " + json.dumps(platform_info))
         return self._render_response(platform_info)
 
-    @AuthJSONRPCServer.deprecated()
     def jsonrpc_report_bug(self, message=None):
         """
         Report a bug to slack
 
         Usage:
             report_bug (<message> | --message=<message>)
-
-        Options:
-            --message=<message> : (str) Description of the bug
 
         Returns:
             (bool) true if successful
@@ -1160,9 +1167,6 @@ class Daemon(AuthJSONRPCServer):
         Usage:
             settings_get
 
-        Options:
-            None
-
         Returns:
             (dict) Dictionary of daemon settings
             See ADJUSTABLE_SETTINGS in lbrynet/conf.py for full list of settings
@@ -1176,43 +1180,47 @@ class Daemon(AuthJSONRPCServer):
         Set daemon settings
 
         Usage:
-            settings_set [--download_directory=<download_directory>]
-                         [--data_rate=<data_rate>]
-                         [--download_timeout=<download_timeout>]
-                         [--peer_port=<peer_port>]
-                         [--max_key_fee=<max_key_fee>]
-                         [--disable_max_key_fee=<disable_max_key_fee>]
-                         [--use_upnp=<use_upnp>]
-                         [--run_reflector_server=<run_reflector_server>]
-                         [--cache_time=<cache_time>]
-                         [--reflect_uploads=<reflect_uploads>]
-                         [--share_usage_data=<share_usage_data>]
-                         [--peer_search_timeout=<peer_search_timeout>]
-                         [--sd_download_timeout=<sd_download_timeout>]
-                         [--auto_renew_claim_height_delta=<auto_renew_claim_height_delta>]
+            settings_set [<download_directory> | --download_directory=<download_directory>]
+                         [<data_rate> | --data_rate=<data_rate>]
+                         [<download_timeout> | --download_timeout=<download_timeout>]
+                         [<peer_port> | --peer_port=<peer_port>]
+                         [<max_key_fee> | --max_key_fee=<max_key_fee>]
+                         [<disable_max_key_fee> | --disable_max_key_fee=<disable_max_key_fee>]
+                         [<use_upnp> | --use_upnp=<use_upnp>]
+                         [<run_reflector_server> | --run_reflector_server=<run_reflector_server>]
+                         [<cache_time> | --cache_time=<cache_time>]
+                         [<reflect_uploads> | --reflect_uploads=<reflect_uploads>]
+                         [<share_usage_data> | --share_usage_data=<share_usage_data>]
+                         [<peer_search_timeout> | --peer_search_timeout=<peer_search_timeout>]
+                         [<sd_download_timeout> | --sd_download_timeout=<sd_download_timeout>]
+                         [<auto_renew_claim_height_delta>
+                            | --auto_renew_claim_height_delta=<auto_renew_claim_height_delta]
 
         Options:
-            --download_directory=<download_directory>  : (str) path of download directory
-            --data_rate=<data_rate>                    : (float) 0.0001
-            --download_timeout=<download_timeout>      : (int) 180
-            --peer_port=<peer_port>                    : (int) 3333
-            --max_key_fee=<max_key_fee>                : (dict) maximum key fee for downloads,
-                                                          in the format:
-                                                          {
-                                                            'currency': <currency_symbol>,
-                                                            'amount': <amount>
-                                                          }.
-                                                          In the CLI, it must be an escaped JSON string
-                                                          Supported currency symbols: LBC, USD, BTC
-            --disable_max_key_fee=<disable_max_key_fee> : (bool) False
-            --use_upnp=<use_upnp>            : (bool) True
-            --run_reflector_server=<run_reflector_server>  : (bool) False
-            --cache_time=<cache_time>  : (int) 150
-            --reflect_uploads=<reflect_uploads>  : (bool) True
-            --share_usage_data=<share_usage_data>  : (bool) True
-            --peer_search_timeout=<peer_search_timeout>  : (int) 3
-            --sd_download_timeout=<sd_download_timeout>  : (int) 3
-            --auto_renew_claim_height_delta=<auto_renew_claim_height_delta> : (int) 0
+            <download_directory>, --download_directory=<download_directory>  : (str)
+            <data_rate>, --data_rate=<data_rate>                             : (float), 0.0001
+            <download_timeout>, --download_timeout=<download_timeout>        : (int), 180
+            <peer_port>, --peer_port=<peer_port>                             : (int), 3333
+            <max_key_fee>, --max_key_fee=<max_key_fee>   : (dict) maximum key fee for downloads,
+                                                            in the format: {
+                                                                "currency": <currency_symbol>,
+                                                                "amount": <amount>
+                                                            }. In the CLI, it must be an escaped
+                                                            JSON string
+                                                            Supported currency symbols:
+                                                                LBC
+                                                                BTC
+                                                                USD
+            <disable_max_key_fee>, --disable_max_key_fee=<disable_max_key_fee> : (bool), False
+            <use_upnp>, --use_upnp=<use_upnp>            : (bool), True
+            <run_reflector_server>, --run_reflector_server=<run_reflector_server>  : (bool), False
+            <cache_time>, --cache_time=<cache_time>  : (int), 150
+            <reflect_uploads>, --reflect_uploads=<reflect_uploads>  : (bool), True
+            <share_usage_data>, --share_usage_data=<share_usage_data>  : (bool), True
+            <peer_search_timeout>, --peer_search_timeout=<peer_search_timeout>  : (int), 3
+            <sd_download_timeout>, --sd_download_timeout=<sd_download_timeout>  : (int), 3
+            <auto_renew_claim_height_delta>,
+                --auto_renew_claim_height_delta=<auto_renew_claim_height_delta> : (int), 0
                 claims set to expire within this many blocks will be
                 automatically renewed after startup (if set to 0, renews
                 will not be made automatically)
@@ -1233,10 +1241,7 @@ class Daemon(AuthJSONRPCServer):
             help [<command> | --command=<command>]
 
         Options:
-            --command=<command>  : (str) command to retrieve documentation for
-
-        Returns:
-            (str) Help message
+            <command>, --command=<command>  : command to retrieve documentation for
         """
 
         if command is None:
@@ -1265,25 +1270,22 @@ class Daemon(AuthJSONRPCServer):
         Usage:
             commands
 
-        Options:
-            None
-
         Returns:
             (list) list of available commands
         """
         return self._render_response(sorted([command for command in self.callable_methods.keys()]))
 
+    @AuthJSONRPCServer.flags(include_unconfirmed='-u')
     def jsonrpc_wallet_balance(self, address=None, include_unconfirmed=False):
         """
         Return the balance of the wallet
 
         Usage:
-            wallet_balance [<address> | --address=<address>] [--include_unconfirmed]
+            wallet_balance [<address> | --address=<address>] [-u]
 
         Options:
-            --address=<address>     : (str) If provided only the balance for this
-                                      address will be given
-            --include_unconfirmed   : (bool) Include unconfirmed
+            <address>  :  If provided only the balance for this address will be given
+            -u         :  Include unconfirmed
 
         Returns:
             (float) amount of lbry credits in wallet
@@ -1300,10 +1302,7 @@ class Daemon(AuthJSONRPCServer):
         Unlock an encrypted wallet
 
         Usage:
-            wallet_unlock (<password> | --password=<password>)
-
-        Options:
-            --password=<password> : (str) password for unlocking wallet
+            wallet_unlock (<password>)
 
         Returns:
             (bool) true if wallet is unlocked, otherwise false
@@ -1327,9 +1326,6 @@ class Daemon(AuthJSONRPCServer):
         Usage:
             wallet_decrypt
 
-        Options:
-            None
-
         Returns:
             (bool) true if wallet is decrypted, otherwise false
         """
@@ -1345,10 +1341,7 @@ class Daemon(AuthJSONRPCServer):
         the password
 
         Usage:
-            wallet_encrypt (<new_password> | --new_password=<new_password>)
-
-        Options:
-            --new_password=<new_password> : (str) password string to be used for encrypting wallet
+            wallet_encrypt (<new_password>)
 
         Returns:
             (bool) true if wallet is decrypted, otherwise false
@@ -1366,9 +1359,6 @@ class Daemon(AuthJSONRPCServer):
         Usage:
             daemon_stop
 
-        Options:
-            None
-
         Returns:
             (string) Shutdown message
         """
@@ -1379,31 +1369,23 @@ class Daemon(AuthJSONRPCServer):
         defer.returnValue(response)
 
     @defer.inlineCallbacks
+    @AuthJSONRPCServer.flags(full_status='-f')
     def jsonrpc_file_list(self, **kwargs):
         """
         List files limited by optional filters
 
         Usage:
             file_list [--sd_hash=<sd_hash>] [--file_name=<file_name>] [--stream_hash=<stream_hash>]
-                      [--rowid=<rowid>] [--claim_id=<claim_id>] [--outpoint=<outpoint>] [--txid=<txid>] [--nout=<nout>]
-                      [--channel_claim_id=<channel_claim_id>] [--channel_name=<channel_name>]
-                      [--claim_name=<claim_name>] [--full_status]
+                      [--rowid=<rowid>]
+                      [-f]
 
         Options:
-            --sd_hash=<sd_hash>                    : (str) get file with matching sd hash
-            --file_name=<file_name>                : (str) get file with matching file name in the
-                                                     downloads folder
-            --stream_hash=<stream_hash>            : (str) get file with matching stream hash
-            --rowid=<rowid>                        : (int) get file with matching row id
-            --claim_id=<claim_id>                  : (str) get file with matching claim id
-            --outpoint=<outpoint>                  : (str) get file with matching claim outpoint
-            --txid=<txid>                          : (str) get file with matching claim txid
-            --nout=<nout>                          : (int) get file with matching claim nout
-            --channel_claim_id=<channel_claim_id>  : (str) get file with matching channel claim id
-            --channel_name=<channel_name>  : (str) get file with matching channel name
-            --claim_name=<claim_name>              : (str) get file with matching claim name
-            --full_status                          : (bool) full status, populate the
-                                                     'message' and 'size' fields
+            --sd_hash=<sd_hash>          : get file with matching sd hash
+            --file_name=<file_name>      : get file with matching file name in the
+                                           downloads folder
+            --stream_hash=<stream_hash>  : get file with matching stream hash
+            --rowid=<rowid>              : get file with matching row id
+            -f                           : full status, populate the 'message' and 'size' fields
 
         Returns:
             (list) List of files
@@ -1427,14 +1409,7 @@ class Daemon(AuthJSONRPCServer):
                     'blobs_completed': (int) num_completed, None if full_status is false,
                     'blobs_in_stream': (int) None if full_status is false,
                     'status': (str) downloader status, None if full_status is false,
-                    'claim_id': (str) None if full_status is false or if claim is not found,
-                    'outpoint': (str) None if full_status is false or if claim is not found,
-                    'txid': (str) None if full_status is false or if claim is not found,
-                    'nout': (int) None if full_status is false or if claim is not found,
-                    'metadata': (dict) None if full_status is false or if claim is not found,
-                    'channel_claim_id': (str) None if full_status is false or if claim is not found or signed,
-                    'channel_name': (str) None if full_status is false or if claim is not found or signed,
-                    'claim_name': (str) None if full_status is false or if claim is not found
+                    'outpoint': (str), None if full_status is false or if claim is not found
                 },
             ]
         """
@@ -1444,16 +1419,16 @@ class Daemon(AuthJSONRPCServer):
         defer.returnValue(response)
 
     @defer.inlineCallbacks
+    @AuthJSONRPCServer.flags(force='-f')
     def jsonrpc_resolve_name(self, name, force=False):
         """
         Resolve stream info from a LBRY name
 
         Usage:
-            resolve_name (<name> | --name=<name>) [--force]
+            resolve_name <name> [-f]
 
         Options:
-            --name=<name> : (str) the name to resolve
-            --force       : (bool) force refresh and do not check cache
+            -f  : force refresh and do not check cache
 
         Returns:
             (dict) Metadata dictionary from name claim, None if the name is not
@@ -1478,11 +1453,11 @@ class Daemon(AuthJSONRPCServer):
                        [<claim_id> | --claim_id=<claim_id>]
 
         Options:
-            --txid=<txid>              : (str) look for claim with this txid, nout must
-                                         also be specified
-            --nout=<nout>              : (int) look for claim with this nout, txid must
-                                         also be specified
-            --claim_id=<claim_id>  : (str) look for claim with this claim id
+            <txid>, --txid=<txid>              : look for claim with this txid, nout must
+                                                    also be specified
+            <nout>, --nout=<nout>              : look for claim with this nout, txid must
+                                                    also be specified
+            <claim_id>, --claim_id=<claim_id>  : look for claim with this claim id
 
         Returns:
             (dict) Dictionary containing claim info as below,
@@ -1516,17 +1491,16 @@ class Daemon(AuthJSONRPCServer):
 
     @AuthJSONRPCServer.auth_required
     @defer.inlineCallbacks
+    @AuthJSONRPCServer.flags(force='-f')
     def jsonrpc_resolve(self, force=False, uri=None, uris=[]):
         """
         Resolve given LBRY URIs
 
         Usage:
-            resolve [--force] (<uri> | --uri=<uri>) [<uris>...]
+            resolve [-f] (<uri> | --uri=<uri>) [<uris>...]
 
         Options:
-            --force  : (bool) force refresh and ignore cache
-            --uri=<uri>    : (str) uri to resolve
-            --uris=<uris>   : (list) uris to resolve
+            -f  : force refresh and ignore cache
 
         Returns:
             Dictionary of results, keyed by uri
@@ -1546,7 +1520,6 @@ class Daemon(AuthJSONRPCServer):
                         'depth': (int) claim depth,
                         'has_signature': (bool) included if decoded_claim
                         'name': (str) claim name,
-                        'permanent_url': (str) permanent url of the certificate claim,
                         'supports: (list) list of supports [{'txid': (str) txid,
                                                              'nout': (int) nout,
                                                              'amount': (float) amount}],
@@ -1571,7 +1544,6 @@ class Daemon(AuthJSONRPCServer):
                         'depth': (int) claim depth,
                         'has_signature': (bool) included if decoded_claim
                         'name': (str) claim name,
-                        'permanent_url': (str) permanent url of the claim,
                         'channel_name': (str) channel name if claim is in a channel
                         'supports: (list) list of supports [{'txid': (str) txid,
                                                              'nout': (int) nout,
@@ -1616,46 +1588,35 @@ class Daemon(AuthJSONRPCServer):
 
 
         Options:
-            --uri=<uri>              : (str) uri of the content to download
-            --file_name=<file_name>  : (str) specified name for the downloaded file
-            --timeout=<timeout>      : (int) download timeout in number of seconds
+            <file_name>           : specified name for the downloaded file
+            <timeout>             : download timeout in number of seconds
+            <download_directory>  : path to directory where file will be saved
 
         Returns:
             (dict) Dictionary containing information about the stream
             {
-                'completed': (bool) true if download is completed,
-                'file_name': (str) name of file,
-                'download_directory': (str) download directory,
-                'points_paid': (float) credit paid to download file,
-                'stopped': (bool) true if download is stopped,
-                'stream_hash': (str) stream hash of file,
-                'stream_name': (str) stream name ,
-                'suggested_file_name': (str) suggested file name,
-                'sd_hash': (str) sd hash of file,
-                'download_path': (str) download path of file,
-                'mime_type': (str) mime type of file,
-                'key': (str) key attached to file,
-                'total_bytes': (int) file size in bytes, None if full_status is false,
-                'written_bytes': (int) written size in bytes,
-                'blobs_completed': (int) num_completed, None if full_status is false,
-                'blobs_in_stream': (int) None if full_status is false,
-                'status': (str) downloader status, None if full_status is false,
-                'claim_id': (str) claim id,
-                'outpoint': (str) claim outpoint string,
-                'txid': (str) claim txid,
-                'nout': (int) claim nout,
-                'metadata': (dict) claim metadata,
-                'channel_claim_id': (str) None if claim is not signed
-                'channel_name': (str) None if claim is not signed
-                'claim_name': (str) claim name
+                    'completed': (bool) true if download is completed,
+                    'file_name': (str) name of file,
+                    'download_directory': (str) download directory,
+                    'points_paid': (float) credit paid to download file,
+                    'stopped': (bool) true if download is stopped,
+                    'stream_hash': (str) stream hash of file,
+                    'stream_name': (str) stream name ,
+                    'suggested_file_name': (str) suggested file name,
+                    'sd_hash': (str) sd hash of file,
+                    'download_path': (str) download path of file,
+                    'mime_type': (str) mime type of file,
+                    'key': (str) key attached to file,
+                    'total_bytes': (int) file size in bytes, None if full_status is false,
+                    'written_bytes': (int) written size in bytes,
+                    'blobs_completed': (int) num_completed, None if full_status is false,
+                    'blobs_in_stream': (int) None if full_status is false,
+                    'status': (str) downloader status, None if full_status is false,
+                    'outpoint': (str), None if full_status is false or if claim is not found
             }
         """
 
         timeout = timeout if timeout is not None else self.download_timeout
-
-        parsed_uri = parse_lbry_uri(uri)
-        if parsed_uri.is_channel and not parsed_uri.path:
-            raise Exception("cannot download a channel claim, specify a /path")
 
         resolved_result = yield self.session.wallet.resolve(uri)
         if resolved_result and uri in resolved_result:
@@ -1666,8 +1627,7 @@ class Daemon(AuthJSONRPCServer):
         if not resolved or 'value' not in resolved:
             if 'claim' not in resolved:
                 raise Exception(
-                    "Failed to resolve stream at lbry://{}".format(uri.replace("lbry://", ""))
-                )
+                    "Failed to resolve stream at lbry://{}".format(uri.replace("lbry://", "")))
             else:
                 resolved = resolved['claim']
         txid, nout, name = resolved['txid'], resolved['nout'], resolved['name']
@@ -1701,16 +1661,15 @@ class Daemon(AuthJSONRPCServer):
         Start or stop downloading a file
 
         Usage:
-            file_set_status (<status> | --status=<status>) [--sd_hash=<sd_hash>]
-                      [--file_name=<file_name>] [--stream_hash=<stream_hash>] [--rowid=<rowid>]
+            file_set_status <status> [--sd_hash=<sd_hash>] [--file_name=<file_name>]
+                      [--stream_hash=<stream_hash>] [--rowid=<rowid>]
 
         Options:
-            --status=<status>            : (str) one of "start" or "stop"
-            --sd_hash=<sd_hash>          : (str) set status of file with matching sd hash
-            --file_name=<file_name>      : (str) set status of file with matching file name in the
+            --sd_hash=<sd_hash>          : set status of file with matching sd hash
+            --file_name=<file_name>      : set status of file with matching file name in the
                                            downloads folder
-            --stream_hash=<stream_hash>  : (str) set status of file with matching stream hash
-            --rowid=<rowid>              : (int) set status of file with matching row id
+            --stream_hash=<stream_hash>  : set status of file with matching stream hash
+            --rowid=<rowid>              : set status of file with matching row id
 
         Returns:
             (str) Confirmation message
@@ -1737,32 +1696,25 @@ class Daemon(AuthJSONRPCServer):
 
     @AuthJSONRPCServer.auth_required
     @defer.inlineCallbacks
+    @AuthJSONRPCServer.flags(delete_from_download_dir='-f', delete_all='--delete_all')
     def jsonrpc_file_delete(self, delete_from_download_dir=False, delete_all=False, **kwargs):
         """
         Delete a LBRY file
 
         Usage:
-            file_delete [--delete_from_download_dir] [--delete_all] [--sd_hash=<sd_hash>] [--file_name=<file_name>]
-                        [--stream_hash=<stream_hash>] [--rowid=<rowid>] [--claim_id=<claim_id>] [--txid=<txid>]
-                        [--nout=<nout>] [--claim_name=<claim_name>] [--channel_claim_id=<channel_claim_id>]
-                        [--channel_name=<channel_name>]
+            file_delete [-f] [--delete_all] [--sd_hash=<sd_hash>] [--file_name=<file_name>]
+                        [--stream_hash=<stream_hash>] [--rowid=<rowid>]
 
         Options:
-            --delete_from_download_dir             : (bool) delete file from download directory,
-                                                    instead of just deleting blobs
-            --delete_all                           : (bool) if there are multiple matching files,
-                                                     allow the deletion of multiple files.
-                                                     Otherwise do not delete anything.
-            --sd_hash=<sd_hash>                    : (str) delete by file sd hash
-            --file_name<file_name>                 : (str) delete by file name in downloads folder
-            --stream_hash=<stream_hash>            : (str) delete by file stream hash
-            --rowid=<rowid>                        : (int) delete by file row id
-            --claim_id=<claim_id>                  : (str) delete by file claim id
-            --txid=<txid>                          : (str) delete by file claim txid
-            --nout=<nout>                          : (int) delete by file claim nout
-            --claim_name=<claim_name>              : (str) delete by file claim name
-            --channel_claim_id=<channel_claim_id>  : (str) delete by file channel claim id
-            --channel_name=<channel_name>                 : (str) delete by file channel claim name
+            -f, --delete_from_download_dir  : delete file from download directory,
+                                                instead of just deleting blobs
+            --delete_all                    : if there are multiple matching files,
+                                                allow the deletion of multiple files.
+                                                Otherwise do not delete anything.
+            --sd_hash=<sd_hash>             : delete by file sd hash
+            --file_name<file_name>          : delete by file name in downloads folder
+            --stream_hash=<stream_hash>     : delete by file stream hash
+            --rowid=<rowid>                 : delete by file row id
 
         Returns:
             (bool) true if deletion was successful
@@ -1802,11 +1754,10 @@ class Daemon(AuthJSONRPCServer):
         Get estimated cost for a lbry stream
 
         Usage:
-            stream_cost_estimate (<uri> | --uri=<uri>) [<size> | --size=<size>]
+            stream_cost_estimate <uri> [<size> | --size=<size>]
 
         Options:
-            --uri=<uri>      : (str) uri to use
-            --size=<size>  : (float) stream size in bytes. if provided an sd blob won't be
+            <size>, --size=<size>  : stream size in bytes. if provided an sd blob won't be
                                      downloaded.
 
         Returns:
@@ -1825,10 +1776,6 @@ class Daemon(AuthJSONRPCServer):
         Usage:
             channel_new (<channel_name> | --channel_name=<channel_name>)
                         (<amount> | --amount=<amount>)
-
-        Options:
-            --channel_name=<channel_name>    : (str) name of the channel prefixed with '@'
-            --amount=<amount>                : (float) bid amount on the channel
 
         Returns:
             (dict) Dictionary containing result of the claim
@@ -1851,17 +1798,8 @@ class Daemon(AuthJSONRPCServer):
             raise Exception("Invalid channel name")
         if amount <= 0:
             raise Exception("Invalid amount")
-
-        balance = yield self.session.wallet.get_max_usable_balance_for_claim(channel_name)
-        max_bid_amount = balance - MAX_UPDATE_FEE_ESTIMATE
-        if balance <= MAX_UPDATE_FEE_ESTIMATE:
-            raise InsufficientFundsError(
-                "Insufficient funds, please deposit additional LBC. Minimum additional LBC needed {}"
-                .format(MAX_UPDATE_FEE_ESTIMATE - balance))
-        elif amount > max_bid_amount:
-            raise InsufficientFundsError(
-                "Please lower the bid value, the maximum amount you can specify for this claim is {}"
-                .format(max_bid_amount))
+        if amount > self.session.wallet.get_balance():
+            raise InsufficientFundsError()
 
         result = yield self.session.wallet.claim_new_channel(channel_name, amount)
         self.analytics_manager.send_new_channel()
@@ -1877,9 +1815,6 @@ class Daemon(AuthJSONRPCServer):
 
         Usage:
             channel_list
-
-        Options:
-            None
 
         Returns:
             (list) ClaimDict, includes 'is_mine' field to indicate if the certificate claim
@@ -1899,9 +1834,6 @@ class Daemon(AuthJSONRPCServer):
         Usage:
             channel_list_mine
 
-        Options:
-            None
-
         Returns:
             (list) ClaimDict
         """
@@ -1916,9 +1848,6 @@ class Daemon(AuthJSONRPCServer):
 
         Usage:
             channel_export (<claim_id> | --claim_id=<claim_id>)
-
-        Options:
-            --claim_id=<claim_id> : (str) Claim ID to export information about
 
         Returns:
             (str) Serialized certificate information
@@ -1936,9 +1865,6 @@ class Daemon(AuthJSONRPCServer):
         Usage:
             channel_import (<serialized_certificate_info> |
                             --serialized_certificate_info=<serialized_certificate_info>)
-
-        Options:
-            --serialized_certificate_info=<serialized_certificate_info> : (str) certificate info
 
         Returns:
             (dict) Result dictionary
@@ -1980,15 +1906,13 @@ class Daemon(AuthJSONRPCServer):
                     [--claim_address=<claim_address>] [--change_address=<change_address>]
 
         Options:
-            --name=<name>                  : (str) name of the content
-            --bid=<bid>                    : (float) amount to back the claim
-            --metadata=<metadata>          : (dict) ClaimDict to associate with the claim.
-            --file_path=<file_path>        : (str) path to file to be associated with name. If provided,
+            --metadata=<metadata>          : ClaimDict to associate with the claim.
+            --file_path=<file_path>        : path to file to be associated with name. If provided,
                                              a lbry stream of this file will be used in 'sources'.
                                              If no path is given but a sources dict is provided,
                                              it will be used. If neither are provided, an
                                              error is raised.
-            --fee=<fee>                    : (dict) Dictionary representing key fee to download content:
+            --fee=<fee>                    : Dictionary representing key fee to download content:
                                               {
                                                 'currency': currency_symbol,
                                                 'amount': float,
@@ -1997,22 +1921,22 @@ class Daemon(AuthJSONRPCServer):
                                               supported currencies: LBC, USD, BTC
                                               If an address is not provided a new one will be
                                               automatically generated. Default fee is zero.
-            --title=<title>                : (str) title of the publication
-            --description=<description>    : (str) description of the publication
-            --author=<author>              : (str) author of the publication
-            --language=<language>          : (str) language of the publication
-            --license=<license>            : (str) publication license
-            --license_url=<license_url>    : (str) publication license url
-            --thumbnail=<thumbnail>        : (str) thumbnail url
-            --preview=<preview>            : (str) preview url
-            --nsfw=<nsfw>                  : (bool) title of the publication
-            --sources=<sources>            : (str) {'lbry_sd_hash': sd_hash} specifies sd hash of file
-            --channel_name=<channel_name>  : (str) name of the publisher channel name in the wallet
-            --channel_id=<channel_id>      : (str) claim id of the publisher channel, does not check
+            --title=<title>                : title of the publication
+            --description=<description>    : description of the publication
+            --author=<author>              : author of the publication
+            --language=<language>          : language of the publication
+            --license=<license>            : publication license
+            --license_url=<license_url>    : publication license url
+            --thumbnail=<thumbnail>        : thumbnail url
+            --preview=<preview>            : preview url
+            --nsfw=<nsfw>                  : title of the publication
+            --sources=<sources>            : {'lbry_sd_hash':sd_hash} specifies sd hash of file
+            --channel_name=<channel_name>  : name of the publisher channel name in the wallet
+            --channel_id=<channel_id>      : claim id of the publisher channel, does not check
                                              for channel claim being in the wallet. This allows
                                              publishing to a channel where only the certificate
                                              private key is in the wallet.
-           --claim_address=<claim_address> : (str) address where the claim is sent to, if not specified
+           --claim_address=<claim_address> : address where the claim is sent to, if not specified
                                              new address wil automatically be created
 
         Returns:
@@ -2031,24 +1955,12 @@ class Daemon(AuthJSONRPCServer):
         except (TypeError, URIParseError):
             raise Exception("Invalid name given to publish")
 
-        if not isinstance(bid, (float, int)):
-            raise TypeError("Bid must be a float or an integer.")
-
         if bid <= 0.0:
-            raise ValueError("Bid value must be greater than 0.0")
+            raise Exception("Invalid bid")
 
-        yield self.session.wallet.update_balance()
         if bid >= self.session.wallet.get_balance():
-            balance = yield self.session.wallet.get_max_usable_balance_for_claim(name)
-            max_bid_amount = balance - MAX_UPDATE_FEE_ESTIMATE
-            if balance <= MAX_UPDATE_FEE_ESTIMATE:
-                raise InsufficientFundsError(
-                    "Insufficient funds, please deposit additional LBC. Minimum additional LBC needed {}"
-                    .format(MAX_UPDATE_FEE_ESTIMATE - balance))
-            elif bid > max_bid_amount:
-                raise InsufficientFundsError(
-                    "Please lower the bid. After accounting for the estimated fee, you only have {} left."
-                    .format(max_bid_amount))
+            raise InsufficientFundsError('Insufficient funds. ' \
+                                         'Make sure you have enough LBC to deposit')
 
         metadata = metadata or {}
         if fee is not None:
@@ -2134,8 +2046,6 @@ class Daemon(AuthJSONRPCServer):
             'claim_address': claim_address,
             'change_address': change_address,
             'claim_dict': claim_dict,
-            'channel_id': channel_id,
-            'channel_name': channel_name
         })
 
         if channel_id:
@@ -2167,12 +2077,7 @@ class Daemon(AuthJSONRPCServer):
             claim_abandon [<claim_id> | --claim_id=<claim_id>]
                           [<txid> | --txid=<txid>] [<nout> | --nout=<nout>]
 
-        Options:
-            --claim_id=<claim_id> : (str) claim_id of the claim to abandon
-            --txid=<txid> : (str) txid of the claim to abandon
-            --nout=<nout> : (int) nout of the claim to abandon
-
-        Returns:
+        Return:
             (dict) Dictionary containing result of the claim
             {
                 txid : (str) txid of resulting transaction
@@ -2200,12 +2105,7 @@ class Daemon(AuthJSONRPCServer):
             claim_new_support (<name> | --name=<name>) (<claim_id> | --claim_id=<claim_id>)
                               (<amount> | --amount=<amount>)
 
-        Options:
-            --name=<name> : (str) name of the claim to support
-            --claim_id=<claim_id> : (str) claim_id of the claim to support
-            --amount=<amount> : (float) amount of support
-
-        Returns:
+        Return:
             (dict) Dictionary containing result of the claim
             {
                 txid : (str) txid of resulting support claim
@@ -2227,11 +2127,7 @@ class Daemon(AuthJSONRPCServer):
         Usage:
             claim_renew (<outpoint> | --outpoint=<outpoint>) | (<height> | --height=<height>)
 
-        Options:
-            --outpoint=<outpoint> : (str) outpoint of the claim to renew
-            --height=<height> : (str) update claims expiring before or at this block height
-
-        Returns:
+        Return:
             (dict) Dictionary where key is the the original claim's outpoint and
             value is the result of the renewal
             {
@@ -2273,21 +2169,8 @@ class Daemon(AuthJSONRPCServer):
                                   [<amount> | --amount=<amount>]
 
         Options:
-            --claim_id=<claim_id>   : (str) claim_id to send
-            --address=<address>     : (str) address to send the claim to
-            --amount<amount>        : (int) Amount of credits to claim name for, defaults to the current amount
-                                            on the claim
-
-        Returns:
-            (dict) Dictionary containing result of the claim
-            {
-                'tx' : (str) hex encoded transaction
-                'txid' : (str) txid of resulting claim
-                'nout' : (int) nout of the resulting claim
-                'fee' : (float) fee paid for the claim transaction
-                'claim_id' : (str) claim ID of the resulting claim
-            }
-
+            <amount>  : Amount of credits to claim name for, defaults to the current amount
+                        on the claim
         """
         result = yield self.session.wallet.send_claim_to_address(claim_id, address, amount)
         response = yield self._render_response(result)
@@ -2302,10 +2185,7 @@ class Daemon(AuthJSONRPCServer):
         Usage:
             claim_list_mine
 
-        Options:
-            None
-
-        Returns:
+        Returns
             (list) List of name claims owned by user
             [
                 {
@@ -2320,7 +2200,6 @@ class Daemon(AuthJSONRPCServer):
                     'height': (int) height of the block containing the claim
                     'is_spent': (bool) true if claim is abandoned, false otherwise
                     'name': (str) name of the claim
-                    'permanent_url': (str) permanent url of the claim,
                     'txid': (str) txid of the cliam
                     'nout': (int) nout of the claim
                     'value': (str) value of the claim
@@ -2340,10 +2219,7 @@ class Daemon(AuthJSONRPCServer):
         Usage:
             claim_list (<name> | --name=<name>)
 
-        Options:
-            --name=<name> : (str) name of the claim to list info about
-
-        Returns:
+        Returns
             (dict) State of claims assigned for the name
             {
                 'claims': (list) list of claims for the name
@@ -2356,7 +2232,6 @@ class Daemon(AuthJSONRPCServer):
                     'height': (int) height of block containing the claim
                     'txid': (str) txid of the claim
                     'nout': (int) nout of the claim
-                    'permanent_url': (str) permanent url of the claim,
                     'supports': (list) a list of supports attached to the claim
                     'value': (str) the value of the claim
                     },
@@ -2380,11 +2255,9 @@ class Daemon(AuthJSONRPCServer):
                                    [--page_size=<page_size>]
 
         Options:
-            --uri=<uri>              : (str) uri of the channel
-            --uris=<uris>            : (list) uris of the channel
-            --page=<page>            : (int) which page of results to return where page 1 is the first
-                                             page, defaults to no pages
-            --page_size=<page_size>  : (int) number of results in a page, default of 10
+            --page=<page>            : which page of results to return where page 1 is the first
+                                       page, defaults to no pages
+            --page_size=<page_size>  : number of results in a page, default of 10
 
         Returns:
             {
@@ -2460,64 +2333,47 @@ class Daemon(AuthJSONRPCServer):
         defer.returnValue(response)
 
     @AuthJSONRPCServer.auth_required
-    def jsonrpc_transaction_list(self):
+    @AuthJSONRPCServer.flags(include_tip_info='-t')
+    def jsonrpc_transaction_list(self, include_tip_info=False):
         """
         List transactions belonging to wallet
 
         Usage:
-            transaction_list
+            transaction_list [-t]
 
         Options:
-            None
+            -t  : Include claim tip information
 
         Returns:
-            (list) List of transactions
+            (list) List of transactions, where is_tip is null by default,
+             and set to a boolean if include_tip_info is true
 
             {
-                "claim_info": (list) claim info if in txn [{
-                                                        "address": (str) address of claim,
-                                                        "balance_delta": (float) bid amount,
-                                                        "amount": (float) claim amount,
-                                                        "claim_id": (str) claim id,
-                                                        "claim_name": (str) claim name,
-                                                        "nout": (int) nout
-                                                        }],
-                "abandon_info": (list) abandon info if in txn [{
-                                                        "address": (str) address of abandoned claim,
-                                                        "balance_delta": (float) returned amount,
-                                                        "amount": (float) claim amount,
-                                                        "claim_id": (str) claim id,
-                                                        "claim_name": (str) claim name,
-                                                        "nout": (int) nout
-                                                        }],
+                "claim_info": (list) claim info if in txn [{"amount": (float) claim amount,
+                                                            "claim_id": (str) claim id,
+                                                            "claim_name": (str) claim name,
+                                                            "nout": (int) nout}],
                 "confirmations": (int) number of confirmations for the txn,
                 "date": (str) date and time of txn,
                 "fee": (float) txn fee,
-                "support_info": (list) support info if in txn [{
-                                                        "address": (str) address of support,
-                                                        "balance_delta": (float) support amount,
-                                                        "amount": (float) support amount,
-                                                        "claim_id": (str) claim id,
-                                                        "claim_name": (str) claim name,
-                                                        "is_tip": (bool),
-                                                        "nout": (int) nout
-                                                        }],
+                "support_info": (list) support info if in txn [{"amount": (float) support amount,
+                                                                "claim_id": (str) claim id,
+                                                                "claim_name": (str) claim name,
+                                                                "is_tip": (null) default,
+                                                                (bool) if include_tip_info is true,
+                                                                "nout": (int) nout}],
                 "timestamp": (int) timestamp,
                 "txid": (str) txn id,
-                "update_info": (list) update info if in txn [{
-                                                        "address": (str) address of claim,
-                                                        "balance_delta": (float) credited/debited
-                                                        "amount": (float) absolute amount,
-                                                        "claim_id": (str) claim id,
-                                                        "claim_name": (str) claim name,
-                                                        "nout": (int) nout
-                                                        }],
+                "update_info": (list) update info if in txn [{"amount": (float) updated amount,
+                                                              "claim_id": (str) claim id,
+                                                              "claim_name": (str) claim name,
+                                                              "nout": (int) nout}],
                 "value": (float) value of txn
             }
 
         """
 
-        d = self.session.wallet.get_history()
+        d = self.session.wallet.get_history(include_tip_info)
         d.addCallback(lambda r: self._render_response(r))
         return d
 
@@ -2527,9 +2383,6 @@ class Daemon(AuthJSONRPCServer):
 
         Usage:
             transaction_show (<txid> | --txid=<txid>)
-
-        Options:
-            --txid=<txid>  : (str) txid of the transaction
 
         Returns:
             (dict) JSON formatted transaction
@@ -2547,9 +2400,6 @@ class Daemon(AuthJSONRPCServer):
         Usage:
             wallet_is_address_mine (<address> | --address=<address>)
 
-        Options:
-            --address=<address>  : (str) address to check
-
         Returns:
             (bool) true, if address is associated with current wallet
         """
@@ -2565,9 +2415,6 @@ class Daemon(AuthJSONRPCServer):
 
         Usage:
             wallet_public_key (<address> | --address=<address>)
-
-        Options:
-            --address=<address>  : (str) address for which to get the public key
 
         Returns:
             (list) list of public keys associated with address.
@@ -2587,9 +2434,6 @@ class Daemon(AuthJSONRPCServer):
         Usage:
             wallet_list
 
-        Options:
-            None
-
         Returns:
             List of wallet addresses
         """
@@ -2605,9 +2449,6 @@ class Daemon(AuthJSONRPCServer):
 
         Usage:
             wallet_new_address
-
-        Options:
-            None
 
         Returns:
             (str) New wallet address in base58
@@ -2631,9 +2472,6 @@ class Daemon(AuthJSONRPCServer):
         Usage:
             wallet_unused_address
 
-        Options:
-            None
-
         Returns:
             (str) Unused wallet address in base58
         """
@@ -2656,10 +2494,6 @@ class Daemon(AuthJSONRPCServer):
 
         Usage:
             send_amount_to_address (<amount> | --amount=<amount>) (<address> | --address=<address>)
-
-        Options:
-            --amount=<amount>     : (float) amount to send
-            --address=<address>   : (str) address to send credits to
 
         Returns:
             (bool) true if payment successfully scheduled
@@ -2689,12 +2523,7 @@ class Daemon(AuthJSONRPCServer):
             wallet_send (<amount> | --amount=<amount>)
                         ((<address> | --address=<address>) | (<claim_id> | --claim_id=<claim_id>))
 
-        Options:
-            --amount=<amount>      : (float) amount of credit to send
-            --address=<address>    : (str) address to send credits to
-            --claim_id=<claim_id>  : (float) claim_id of the claim to send to tip to
-
-        Returns:
+        Return:
             If sending to an address:
             (bool) true if payment successfully scheduled
 
@@ -2738,11 +2567,6 @@ class Daemon(AuthJSONRPCServer):
                                      (<num_addresses> | --num_addresses=<num_addresses>)
                                      (<amount> | --amount=<amount>)
 
-        Options:
-            --no_broadcast                    : (bool) whether to broadcast or not
-            --num_addresses=<num_addresses>   : (int) num of addresses to create
-            --amount=<amount>                 : (float) initial amount in each address
-
         Returns:
             (dict) the resulting transaction
         """
@@ -2765,9 +2589,6 @@ class Daemon(AuthJSONRPCServer):
 
         Usage:
             utxo_list
-
-        Options:
-            None
 
         Returns:
             (list) List of unspent transaction outputs (UTXOs)
@@ -2805,8 +2626,8 @@ class Daemon(AuthJSONRPCServer):
             block_show (<blockhash> | --blockhash=<blockhash>) | (<height> | --height=<height>)
 
         Options:
-            --blockhash=<blockhash>  : (str) hash of the block to look up
-            --height=<height>        : (int) height of the block to look up
+            <blockhash>, --blockhash=<blockhash>  : hash of the block to look up
+            <height>, --height=<height>           : height of the block to look up
 
         Returns:
             (dict) Requested block
@@ -2835,18 +2656,17 @@ class Daemon(AuthJSONRPCServer):
                      [--encoding=<encoding>] [--payment_rate_manager=<payment_rate_manager>]
 
         Options:
-        --blob_hash=<blob_hash>                        : (str) blob hash of the blob to get
-        --timeout=<timeout>                            : (int) timeout in number of seconds
-        --encoding=<encoding>                          : (str) by default no attempt at decoding
-                                                         is made, can be set to one of the
+        --timeout=<timeout>                            : timeout in number of seconds
+        --encoding=<encoding>                          : by default no attempt at decoding is made,
+                                                         can be set to one of the
                                                          following decoders:
                                                             'json'
-        --payment_rate_manager=<payment_rate_manager>  : (str) if not given the default payment rate
+        --payment_rate_manager=<payment_rate_manager>  : if not given the default payment rate
                                                          manager will be used.
                                                          supported alternative rate managers:
                                                             'only-free'
 
-        Returns:
+        Returns
             (str) Success/Fail message or (dict) decoded data
         """
 
@@ -2877,9 +2697,6 @@ class Daemon(AuthJSONRPCServer):
         Usage:
             blob_delete (<blob_hash> | --blob_hash=<blob_hash)
 
-        Options:
-            --blob_hash=<blob_hash>  : (str) blob hash of the blob to delete
-
         Returns:
             (str) Success/fail message
         """
@@ -2888,8 +2705,8 @@ class Daemon(AuthJSONRPCServer):
             response = yield self._render_response("Don't have that blob")
             defer.returnValue(response)
         try:
-            stream_hash = yield self.session.storage.get_stream_hash_for_sd_hash(blob_hash)
-            yield self.session.storage.delete_stream(stream_hash)
+            stream_hash = yield self.stream_info_manager.get_stream_hash_for_sd_hash(blob_hash)
+            yield self.stream_info_manager.delete_stream(stream_hash)
         except Exception as err:
             pass
         yield self.session.blob_manager.delete_blobs([blob_hash])
@@ -2904,8 +2721,7 @@ class Daemon(AuthJSONRPCServer):
             peer_list (<blob_hash> | --blob_hash=<blob_hash>) [<timeout> | --timeout=<timeout>]
 
         Options:
-            --blob_hash=<blob_hash>  : (str) find available peers for this blob hash
-            --timeout=<timeout>      : (int) peer search timeout in seconds
+            <timeout>, --timeout=<timeout>  : peer search timeout in seconds
 
         Returns:
             (list) List of contacts
@@ -2919,44 +2735,44 @@ class Daemon(AuthJSONRPCServer):
         return d
 
     @defer.inlineCallbacks
+    @AuthJSONRPCServer.flags(announce_all="-a")
     def jsonrpc_blob_announce(self, announce_all=None, blob_hash=None,
                               stream_hash=None, sd_hash=None):
         """
         Announce blobs to the DHT
 
         Usage:
-            blob_announce [--announce_all] [<blob_hash> | --blob_hash=<blob_hash>]
+            blob_announce [-a] [<blob_hash> | --blob_hash=<blob_hash>]
                           [<stream_hash> | --stream_hash=<stream_hash>]
                           [<sd_hash> | --sd_hash=<sd_hash>]
 
         Options:
-            --announce_all=<announce_all>  : (bool) announce all the blobs possessed by user
-            --blob_hash=<blob_hash>        : (str) announce a blob, specified by blob_hash
-            --stream_hash=<stream_hash>    : (str) announce all blobs associated with
-                                             stream_hash
-            --sd_hash=<sd_hash>            : (str) announce all blobs associated with
-                                             sd_hash and the sd_hash itself
+            -a                                          : announce all the blobs possessed by user
+            <blob_hash>, --blob_hash=<blob_hash>        : announce a blob, specified by blob_hash
+            <stream_hash>, --stream_hash=<stream_hash>  : announce all blobs associated with
+                                                            stream_hash
+            <sd_hash>, --sd_hash=<sd_hash>              : announce all blobs associated with
+                                                            sd_hash and the sd_hash itself
 
         Returns:
             (bool) true if successful
         """
-
         if announce_all:
             yield self.session.blob_manager.immediate_announce_all_blobs()
         else:
-            blob_hashes = []
             if blob_hash:
-                blob_hashes.append(blob_hash)
-            elif stream_hash or sd_hash:
-                if sd_hash and stream_hash:
-                    raise Exception("either the sd hash or the stream hash should be provided, not both")
-                if sd_hash:
-                    stream_hash = yield self.storage.get_stream_hash_for_sd_hash(sd_hash)
-                blobs = yield self.storage.get_blobs_for_stream(stream_hash, only_completed=True)
-                blob_hashes.extend([blob.blob_hash for blob in blobs])
+                blob_hashes = [blob_hash]
+            elif stream_hash:
+                blobs = yield self.get_blobs_for_stream_hash(stream_hash)
+                blob_hashes = [blob.blob_hash for blob in blobs if blob.get_is_verified()]
+            elif sd_hash:
+                blobs = yield self.get_blobs_for_sd_hash(sd_hash)
+                blob_hashes = [sd_hash] + [blob.blob_hash for blob in blobs if
+                                           blob.get_is_verified()]
             else:
                 raise Exception('single argument must be specified')
-            yield self.session.blob_manager.immediate_announce(blob_hashes)
+            yield self.session.blob_manager._immediate_announce(blob_hashes)
+
         response = yield self._render_response(True)
         defer.returnValue(response)
 
@@ -2967,9 +2783,6 @@ class Daemon(AuthJSONRPCServer):
 
         Usage:
             blob_announce_all
-
-        Options:
-            None
 
         Returns:
             (str) Success/fail message
@@ -2987,12 +2800,12 @@ class Daemon(AuthJSONRPCServer):
                          [--reflector=<reflector>]
 
         Options:
-            --sd_hash=<sd_hash>          : (str) get file with matching sd hash
-            --file_name=<file_name>      : (str) get file with matching file name in the
+            --sd_hash=<sd_hash>          : get file with matching sd hash
+            --file_name=<file_name>      : get file with matching file name in the
                                            downloads folder
-            --stream_hash=<stream_hash>  : (str) get file with matching stream hash
-            --rowid=<rowid>              : (int) get file with matching row id
-            --reflector=<reflector>      : (str) reflector server, ip address or url
+            --stream_hash=<stream_hash>  : get file with matching stream hash
+            --rowid=<rowid>              : get file with matching row id
+            --reflector=<reflector>      : reflector server, ip address or url
                                            by default choose a server from the config
 
         Returns:
@@ -3012,48 +2825,44 @@ class Daemon(AuthJSONRPCServer):
         defer.returnValue(results)
 
     @defer.inlineCallbacks
+    @AuthJSONRPCServer.flags(needed="-n", finished="-f")
     def jsonrpc_blob_list(self, uri=None, stream_hash=None, sd_hash=None, needed=None,
                           finished=None, page_size=None, page=None):
         """
         Returns blob hashes. If not given filters, returns all blobs known by the blob manager
 
         Usage:
-            blob_list [--needed] [--finished] [<uri> | --uri=<uri>]
-                      [<stream_hash> | --stream_hash=<stream_hash>]
-                      [<sd_hash> | --sd_hash=<sd_hash>]
-                      [<page_size> | --page_size=<page_size>]
+            blob_list [-n] [-f] [<uri> | --uri=<uri>] [<stream_hash> | --stream_hash=<stream_hash>]
+                      [<sd_hash> | --sd_hash=<sd_hash>] [<page_size> | --page_size=<page_size>]
                       [<page> | --page=<page>]
 
         Options:
-            --needed                     : (bool) only return needed blobs
-            --finished                   : (bool) only return finished blobs
-            --uri=<uri>                  : (str) filter blobs by stream in a uri
-            --stream_hash=<stream_hash>  : (str) filter blobs by stream hash
-            --sd_hash=<sd_hash>          : (str) filter blobs by sd hash
-            --page_size=<page_size>      : (int) results page size
-            --page=<page>                : (int) page of results to return
+            -n                                          : only return needed blobs
+            -f                                          : only return finished blobs
+            <uri>, --uri=<uri>                          : filter blobs by stream in a uri
+            <stream_hash>, --stream_hash=<stream_hash>  : filter blobs by stream hash
+            <sd_hash>, --sd_hash=<sd_hash>              : filter blobs by sd hash
+            <page_size>, --page_size=<page_size>        : results page size
+            <page>, --page=<page>                       : page of results to return
 
         Returns:
             (list) List of blob hashes
         """
-        if uri or stream_hash or sd_hash:
-            if uri:
-                metadata = yield self._resolve_name(uri)
-                sd_hash = utils.get_sd_hash(metadata)
-                stream_hash = yield self.session.storage.get_stream_hash_for_sd_hash(sd_hash)
-            elif stream_hash:
-                sd_hash = yield self.session.storage.get_sd_blob_hash_for_stream(stream_hash)
-            elif sd_hash:
-                stream_hash = yield self.session.storage.get_stream_hash_for_sd_hash(sd_hash)
-                sd_hash = yield self.session.storage.get_sd_blob_hash_for_stream(stream_hash)
-            if stream_hash:
-                crypt_blobs = yield self.session.storage.get_blobs_for_stream(stream_hash)
-                blobs = [self.session.blob_manager.blobs[crypt_blob.blob_hash] for crypt_blob in crypt_blobs]
-            else:
+
+        if uri:
+            metadata = yield self._resolve_name(uri)
+            sd_hash = utils.get_sd_hash(metadata)
+            blobs = yield self.get_blobs_for_sd_hash(sd_hash)
+        elif stream_hash:
+            try:
+                blobs = yield self.get_blobs_for_stream_hash(stream_hash)
+            except NoSuchStreamHash:
                 blobs = []
-            # get_blobs_for_stream does not include the sd blob, so we'll add it manually
-            if sd_hash in self.session.blob_manager.blobs:
-                blobs = [self.session.blob_manager.blobs[sd_hash]] + blobs
+        elif sd_hash:
+            try:
+                blobs = yield self.get_blobs_for_sd_hash(sd_hash)
+            except NoSuchSDHash:
+                blobs = []
         else:
             blobs = self.session.blob_manager.blobs.itervalues()
 
@@ -3062,7 +2871,7 @@ class Daemon(AuthJSONRPCServer):
         if finished:
             blobs = [blob for blob in blobs if blob.get_is_verified()]
 
-        blob_hashes = [blob.blob_hash for blob in blobs if blob.blob_hash]
+        blob_hashes = [blob.blob_hash for blob in blobs]
         page_size = page_size or len(blob_hashes)
         page = page or 0
         start_index = page * page_size
@@ -3077,9 +2886,6 @@ class Daemon(AuthJSONRPCServer):
 
         Usage:
             blob_reflect_all
-
-        Options:
-            None
 
         Returns:
             (bool) true if successful
@@ -3096,9 +2902,6 @@ class Daemon(AuthJSONRPCServer):
 
         Usage:
             routing_table_get
-
-        Options:
-            None
 
         Returns:
             (dict) dictionary containing routing and contact information
@@ -3177,10 +2980,8 @@ class Daemon(AuthJSONRPCServer):
                               [<blob_timeout> | --blob_timeout=<blob_timeout>]
 
         Options:
-            --blob_hash=<blob_hash>           : (str) check availability for this blob hash
-            --search_timeout=<search_timeout> : (int) how long to search for peers for the blob
-                                                in the dht
-            --blob_timeout=<blob_timeout>     : (int) how long to try downloading from a peer
+            <search_timeout> : how long to search for peers for the blob in the dht
+            <blob_timeout>   : how long to try downloading from a peer
 
         Returns:
             (dict) {
@@ -3202,9 +3003,8 @@ class Daemon(AuthJSONRPCServer):
                              [<peer_timeout> | --peer_timeout=<peer_timeout>]
 
         Options:
-            --uri=<uri>                    : (str) check availability for this uri
-            --sd_timeout=<sd_timeout>      : (int) sd blob download timeout
-            --peer_timeout=<peer_timeout>  : (int) how long to look for peers
+            <sd_timeout>, --sd_timeout=<sd_timeout>        : sd blob download timeout
+            <peer_timeout>, --peer_timeout=<peer_timeout>  : how long to look for peers
 
         Returns:
             (float) Peers per blob / total blobs
@@ -3218,15 +3018,12 @@ class Daemon(AuthJSONRPCServer):
         Get stream availability for lbry uri
 
         Usage:
-            stream_availability (<uri> | --uri=<uri>)
-                                [<search_timeout> | --search_timeout=<search_timeout>]
+            stream_availability (<uri>) [<search_timeout> | --search_timeout=<search_timeout>]
                                 [<blob_timeout> | --blob_timeout=<blob_timeout>]
 
         Options:
-            --uri=<uri>                       : (str) check availability for this uri
-            --search_timeout=<search_timeout> : (int) how long to search for peers for the blob
-                                                in the dht
-            --search_timeout=<blob_timeout>   : (int) how long to try downloading from a peer
+            <search_timeout> : how long to search for peers for the blob in the dht
+            <blob_timeout>   : how long to try downloading from a peer
 
         Returns:
             (dict) {
@@ -3315,22 +3112,21 @@ class Daemon(AuthJSONRPCServer):
         defer.returnValue(response)
 
     @defer.inlineCallbacks
+    @AuthJSONRPCServer.flags(a_arg='-a', b_arg='-b')
     def jsonrpc_cli_test_command(self, pos_arg, pos_args=[], pos_arg2=None, pos_arg3=None,
                                  a_arg=False, b_arg=False):
         """
         This command is only for testing the CLI argument parsing
         Usage:
-            cli_test_command [--a_arg] [--b_arg] (<pos_arg> | --pos_arg=<pos_arg>)
+            cli_test_command [-a] [-b] (<pos_arg> | --pos_arg=<pos_arg>)
                              [<pos_args>...] [--pos_arg2=<pos_arg2>]
                              [--pos_arg3=<pos_arg3>]
 
         Options:
-            --a_arg                            : a arg
-            --b_arg                            : b arg
-            --pos_arg=<pos_arg>                : pos arg
-            --pos_args=<pos_args>              : pos args
-            --pos_arg2=<pos_arg2>              : pos arg 2
-            --pos_arg3=<pos_arg3>              : pos arg 3
+            -a, --a_arg                        : a arg
+            -b, --b_arg                        : b arg
+            <pos_arg2>, --pos_arg2=<pos_arg2>  : pos arg 2
+            <pos_arg3>, --pos_arg3=<pos_arg3>  : pos arg 3
         Returns:
             pos args
         """
@@ -3397,3 +3193,6 @@ def get_blob_payment_rate_manager(session, payment_rate_manager=None):
             payment_rate_manager = rate_managers[payment_rate_manager]
             log.info("Downloading blob with rate manager: %s", payment_rate_manager)
     return payment_rate_manager or session.payment_rate_manager
+
+
+

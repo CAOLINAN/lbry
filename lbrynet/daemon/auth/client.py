@@ -1,3 +1,4 @@
+#coding=utf-8
 import urlparse
 import logging
 import requests
@@ -158,7 +159,9 @@ class AuthAPIClient(object):
 class LBRYAPIClient(object):
     @staticmethod
     def get_client():
-        if not conf.settings:
+        if not conf.settings:  # settings是Config类的实例, 在初始化时作为全局变量被赋值
             conf.initialize_settings()
+            # JSONRPCProxy.from_url:实例化JSONRPCProxy,其中的一种方法
+            # conf.settings.get_api_connection_string(): 组合配置中的host,port,address
         return AuthAPIClient.config() if conf.settings['use_auth_http'] else \
             JSONRPCProxy.from_url(conf.settings.get_api_connection_string())

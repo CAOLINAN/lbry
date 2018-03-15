@@ -1,3 +1,4 @@
+#coding=u8
 import binascii
 import logging
 
@@ -12,8 +13,8 @@ log = logging.getLogger(__name__)
 
 class DHTPeerFinder(object):
     """This class finds peers which have announced to the DHT that they have certain blobs"""
+    """这个类找到了已经向DHT声明它们有某些blobs的peers。"""
     implements(IPeerFinder)
-
     def __init__(self, dht_node, peer_manager):
         """
         dht_node - an instance of dht.Node class
@@ -22,8 +23,19 @@ class DHTPeerFinder(object):
         self.dht_node = dht_node
         self.peer_manager = peer_manager
         self.peers = []
+        self.next_manage_call = None
+
+    def run_manage_loop(self):
+        self._manage_peers()
+        self.next_manage_call = reactor.callLater(60, self.run_manage_loop)
 
     def stop(self):
+        log.info("Stopping DHT peer finder.")
+        if self.next_manage_call is not None and self.next_manage_call.active():
+            self.next_manage_call.cancel()
+            self.next_manage_call = None
+
+    def _manage_peers(self):
         pass
 
     @defer.inlineCallbacks

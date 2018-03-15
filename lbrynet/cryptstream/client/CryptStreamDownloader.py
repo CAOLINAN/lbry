@@ -1,4 +1,3 @@
-import binascii
 import logging
 from zope.interface import implements
 from lbrynet.interfaces import IStreamDownloader
@@ -38,8 +37,8 @@ class CryptStreamDownloader(object):
 
     implements(IStreamDownloader)
 
-    def __init__(self, peer_finder, rate_limiter, blob_manager, payment_rate_manager, wallet,
-                 key, stream_name):
+    def __init__(self, peer_finder, rate_limiter, blob_manager,
+                 payment_rate_manager, wallet):
         """Initialize a CryptStreamDownloader
 
         @param peer_finder: An object which implements the IPeerFinder
@@ -62,8 +61,8 @@ class CryptStreamDownloader(object):
         self.blob_manager = blob_manager
         self.payment_rate_manager = payment_rate_manager
         self.wallet = wallet
-        self.key = binascii.unhexlify(key)
-        self.stream_name = binascii.unhexlify(stream_name)
+        self.key = None
+        self.stream_name = None
         self.completed = False
         self.stopped = True
         self.stopping = False

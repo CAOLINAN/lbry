@@ -1,3 +1,4 @@
+#coding=u8
 import logging
 import os
 
@@ -34,6 +35,7 @@ class DaemonServer(object):
         # TODO: DEPRECATED, remove this and just serve the API at the root
         self.root.putChild(conf.settings['API_ADDRESS'], self._daemon)
 
+        # twisted 的web服务相关功能
         lbrynet_server = get_site_base(use_auth, self.root)
 
         try:
@@ -47,8 +49,8 @@ class DaemonServer(object):
 
     @defer.inlineCallbacks
     def start(self, use_auth):
-        yield self._setup_server(use_auth)
-        yield self._daemon.setup()
+        yield self._setup_server(use_auth)  # 启动twisted的web服务
+        yield self._daemon.setup()  # 钱包和DHT服务
 
     def stop(self):
         if reactor.running:

@@ -120,7 +120,6 @@ class JSONRPCServerType(type):
         klass.callable_methods = {}
         klass.deprecated_methods = {}
         klass.authorized_functions = []
-
         for methodname in dir(klass):
             if methodname.startswith("jsonrpc_"):
                 method = getattr(klass, methodname)

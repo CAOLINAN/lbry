@@ -3,7 +3,7 @@ import json
 import subprocess
 import os
 
-from urllib2 import urlopen, URLError
+from urllib2 import urlopen
 from lbryschema import __version__ as lbryschema_version
 from lbryum import __version__ as LBRYUM_VERSION
 from lbrynet import build_type, __version__ as lbrynet_version
@@ -37,14 +37,10 @@ def get_platform(get_ip=True):
         "build": build_type.BUILD,  # CI server sets this during build step
     }
 
-    # TODO: remove this from get_platform and add a get_external_ip function using txrequests
     if get_ip:
         try:
-            response = json.loads(urlopen("https://api.lbry.io/ip").read())
-            if not response['success']:
-                raise URLError("failed to get external ip")
-            p['ip'] = response['data']['ip']
-        except (URLError, AssertionError):
+            p['ip'] = json.load(urlopen('http://ipv4.jsonip.com'))['ip']
+        except:
             p['ip'] = "Could not determine IP"
 
     return p
